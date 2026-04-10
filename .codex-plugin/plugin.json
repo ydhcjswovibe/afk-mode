@@ -1,0 +1,38 @@
+{
+  "name": "afk-mode",
+  "version": "0.2.0",
+  "description": "Budgeted overnight coding runs for a single repo with isolated slice branches, safety hooks, and run bookkeeping.",
+  "author": {
+    "name": "ydhcjswo",
+    "email": "ydhcjswo@local.invalid",
+    "url": "https://developers.openai.com/codex/plugins/build"
+  },
+  "homepage": "https://github.com/ydhcjswovibe/afk-mode",
+  "repository": "https://github.com/ydhcjswovibe/afk-mode",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "afk-mode",
+    "automation",
+    "workflow"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AFK Mode",
+    "shortDescription": "Budgeted repo automation with safety hooks",
+    "longDescription": "Run a bounded overnight coding session for one repository, track the active run, work on isolated slice branches, and guard risky commands with global Codex hooks.",
+    "developerName": "ydhcjswo",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/ydhcjswovibe/afk-mode",
+    "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
+    "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
+    "defaultPrompt": [
+      "Use $afk-mode to inspect the current repo, ask for a runtime budget, rank safe slices, and run them on isolated branches."
+    ],
+    "brandColor": "#2E6B5B"
+  }
+}

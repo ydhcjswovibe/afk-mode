@@ -1,0 +1,43 @@
+version: 1
+repo_id: afk-mode
+display_name: AFK Mode
+truth:
+  order:
+    - SPEC.md
+    - skills/afk-mode/references/v2-architecture.md
+    - skills/afk-mode/references/execution-policy.md
+verify:
+  commands:
+    - cd scripts && python3 -m unittest test_afk_mode.py
+workflow:
+  status_roots: []
+  execution_entrypoints: []
+guardrails:
+  rules:
+    - id: ask-first-push
+      title: Push changes
+      action: ask_first
+      match_type: category
+      category: git_push
+      approval_scope: rule_for_run
+    - id: deny-global-git-config
+      title: Protect global git config
+      action: deny
+      match_type: category
+      category: global_git_config
+skills:
+  paths:
+    - skills/afk-mode/SKILL.md
+  load_command:
+capabilities:
+  - read_discovery
+  - verification_routing
+  - isolated_write
+  - skill_guidance
+  - session_guardrails
+plugin_overrides:
+  afk_mode:
+    candidate_docs:
+      - SPEC.md
+      - skills/afk-mode/references/v2-architecture.md
+      - skills/afk-mode/references/execution-policy.md
