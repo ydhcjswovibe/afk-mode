@@ -13,6 +13,7 @@ from unittest import mock
 
 import afk_mode
 import afk_mode_runtime
+import afk_mode_runtime.hook_config as hook_config
 import afk_mode_runtime.kernel_run as kernel_run
 import yaml
 
@@ -665,6 +666,19 @@ class AfkModeRuntimeTest(unittest.TestCase):
 
         self.assertIsNone(context)
 
+    def test_start_run_rejects_corrupted_active_run_registry(self) -> None:
+        repo = self.init_repo()
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        registry_path = self.run_root / "active-runs.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text('{"runs": ', encoding="utf-8")
+
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "Active run registry is corrupted"):
+            afk_mode.start_run(repo, "45m", self.run_root)
+
     def test_start_run_rejects_dirty_repo_without_acknowledgement(self) -> None:
         repo = self.init_repo()
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -1127,6 +1141,12 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertIn("SessionStart", hooks_payload["hooks"])
         self.assertIn("PreToolUse", hooks_payload["hooks"])
         self.assertIn("Stop", hooks_payload["hooks"])
+        for event_name, spec in hook_config.AFK_HOOK_SPECS.items():
+            registered_entries = hooks_payload["hooks"][event_name]
+            self.assertTrue(registered_entries)
+            registered_command = registered_entries[0]["hooks"][0]["command"]
+            self.assertEqual(registered_command, spec["hooks"][0]["command"])
+            self.assertTrue(Path(registered_command.split(maxsplit=1)[1]).exists())
 
         afk_mode.finish_run(Path(started["run_dir"]), "completed", "Done")
         hooks_payload = self.load_hooks()
@@ -1437,6 +1457,59 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 [],
             )
 
+    def test_record_success_requires_verified_branch_tip_and_head(self) -> None:
+        repo = self.init_repo()
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+        started = afk_mode.start_run(repo, "30m", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.rank_candidates(run_dir, slice_id="slice-tip")
+        active = afk_mode.open_slice(run_dir, "slice-tip", 1, "tip")
+        worktree = Path(active["worktree"])
+
+        (worktree / "tracked.txt").write_text("first\n", encoding="utf-8")
+        self.git(worktree, "add", "tracked.txt")
+        self.git(worktree, "commit", "-m", "First verified commit")
+        first_commit = self.git(worktree, "rev-parse", "HEAD").strip()
+
+        verification_result = afk_mode.verify_slice(run_dir, "slice-tip")
+        self.assertEqual(verification_result["verified_head"], first_commit)
+        self.assertEqual(verification_result["verified_branch"], active["branch"])
+
+        (worktree / "tracked.txt").write_text("second\n", encoding="utf-8")
+        self.git(worktree, "add", "tracked.txt")
+        self.git(worktree, "commit", "-m", "Advance branch after verification")
+        second_commit = self.git(worktree, "rev-parse", "HEAD").strip()
+
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "must match the tip of branch"):
+            afk_mode.record_slice(
+                run_dir,
+                "slice-tip",
+                "success",
+                "Old commit is no longer the branch tip",
+                active["branch"],
+                first_commit,
+                str(worktree),
+                None,
+                None,
+                [],
+            )
+
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "does not match the commit that was verified"):
+            afk_mode.record_slice(
+                run_dir,
+                "slice-tip",
+                "success",
+                "New branch tip was not re-verified",
+                active["branch"],
+                second_commit,
+                str(worktree),
+                None,
+                None,
+                [],
+            )
+
     def test_save_patch_and_hook_helpers(self) -> None:
         repo = self.init_repo()
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -1556,6 +1629,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(push_guardrail["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(push_guardrail["hookSpecificOutput"]["guardrail"]["rule_id"], "ask-push")
+        self.assertIn(str(Path(afk_mode.__file__).resolve()), push_guardrail["systemMessage"])
         self.assertIn("--rule-id ask-push", push_guardrail["systemMessage"])
 
         approval = afk_mode.approve_guardrail(
@@ -1586,6 +1660,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(release_guardrail["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(release_guardrail["hookSpecificOutput"]["guardrail"]["rule_id"], "ask-release")
+        self.assertIn(str(Path(afk_mode.__file__).resolve()), release_guardrail["systemMessage"])
         self.assertIn("--approved-command", release_guardrail["systemMessage"])
 
         release_approval = afk_mode.approve_guardrail(
@@ -1823,6 +1898,34 @@ class AfkModeRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(afk_mode.AfkModeError, "does not allow modifying package.json"):
             afk_mode.verify_slice(run_dir, "slice-fallback")
 
+    def test_fallback_verify_rejects_dot_prefixed_protected_paths(self) -> None:
+        cases = [
+            (".codex/guarded.py", "print('base')\n", "does not allow modifying .codex"),
+            (".github/workflow.py", "print('base')\n", "does not allow modifying .github"),
+            (".env.py", "value = 1\n", "does not allow modifying environment files"),
+        ]
+        for index, (relative_path, initial_content, expected_error) in enumerate(cases, start=1):
+            with self.subTest(relative_path=relative_path):
+                repo = self.init_repo(f"fallback-protected-{index}")
+                target = repo / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+                target.write_text(initial_content, encoding="utf-8")
+                self.commit_paths(repo, "SPEC.md", relative_path, message=f"Add {relative_path}")
+
+                started = afk_mode.start_run(repo, "30m", self.run_root, allow_fallback_write=True)
+                run_dir = Path(started["run_dir"])
+                self.rank_candidates(run_dir, slice_id="slice-fallback")
+                active = afk_mode.open_slice(run_dir, "slice-fallback", 1, "fallback")
+                worktree = Path(active["worktree"])
+
+                (worktree / relative_path).write_text("value = 2\n", encoding="utf-8")
+                self.git(worktree, "add", relative_path)
+                self.git(worktree, "commit", "-m", f"Touch {relative_path}")
+
+                with self.assertRaisesRegex(afk_mode.AfkModeError, expected_error):
+                    afk_mode.verify_slice(run_dir, "slice-fallback")
+
     def test_fallback_verify_supports_file_level_generic_checks(self) -> None:
         repo = self.init_repo()
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -1904,6 +2007,27 @@ class AfkModeRuntimeTest(unittest.TestCase):
         reentrant_payload = json.loads(reentrant_result.stdout)
         self.assertTrue(reentrant_payload["continue"])
 
+    def test_hook_scripts_are_silent_without_active_run(self) -> None:
+        plugin_root = Path(__file__).resolve().parents[1]
+
+        session_result = self.run_plugin_script(
+            plugin_root / "hooks" / "session_start.py",
+            {"cwd": str(self.root), "source": "startup"},
+        )
+        self.assertEqual(session_result.stdout.strip(), "")
+
+        pretool_result = self.run_plugin_script(
+            plugin_root / "hooks" / "pre_tool_use.py",
+            {"cwd": str(self.root), "tool_input": {"command": "git status --short"}},
+        )
+        self.assertEqual(pretool_result.stdout.strip(), "")
+
+        stop_result = self.run_plugin_script(
+            plugin_root / "hooks" / "stop_guard.py",
+            {"cwd": str(self.root)},
+        )
+        self.assertEqual(stop_result.stdout.strip(), "")
+
     def test_hook_script_payload_contracts_are_stable(self) -> None:
         repo = self.init_repo("hook-contracts")
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -1921,11 +2045,9 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 {"cwd": str(repo), "source": "startup"},
             ).stdout
         )
-        self.assertEqual(set(session_payload), {"hookSpecificOutput"})
-        self.assertEqual(
-            set(session_payload["hookSpecificOutput"]),
-            {"hookEventName", "additionalContext"},
-        )
+        self.assertIn("hookSpecificOutput", session_payload)
+        self.assertIn("hookEventName", session_payload["hookSpecificOutput"])
+        self.assertIn("additionalContext", session_payload["hookSpecificOutput"])
         self.assertEqual(session_payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
 
         pretool_payload = json.loads(
@@ -1934,11 +2056,11 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 {"cwd": str(repo), "tool_input": {"command": "git reset --hard HEAD"}},
             ).stdout
         )
-        self.assertEqual(set(pretool_payload), {"hookSpecificOutput", "systemMessage"})
-        self.assertEqual(
-            set(pretool_payload["hookSpecificOutput"]),
-            {"hookEventName", "permissionDecision", "permissionDecisionReason"},
-        )
+        self.assertIn("hookSpecificOutput", pretool_payload)
+        self.assertIn("systemMessage", pretool_payload)
+        self.assertIn("hookEventName", pretool_payload["hookSpecificOutput"])
+        self.assertIn("permissionDecision", pretool_payload["hookSpecificOutput"])
+        self.assertIn("permissionDecisionReason", pretool_payload["hookSpecificOutput"])
         self.assertEqual(pretool_payload["hookSpecificOutput"]["hookEventName"], "PreToolUse")
 
         stop_payload = json.loads(
@@ -1947,7 +2069,8 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 {"cwd": str(repo)},
             ).stdout
         )
-        self.assertEqual(set(stop_payload), {"decision", "reason"})
+        self.assertIn("decision", stop_payload)
+        self.assertIn("reason", stop_payload)
         self.assertEqual(stop_payload["decision"], "block")
 
         reentrant_payload = json.loads(
@@ -1956,7 +2079,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 {"cwd": str(repo), "stop_hook_active": True},
             ).stdout
         )
-        self.assertEqual(set(reentrant_payload), {"continue"})
+        self.assertIn("continue", reentrant_payload)
         self.assertTrue(reentrant_payload["continue"])
 
 

@@ -23,5 +23,5 @@ AFK Mode is a Codex plugin for bounded unattended repository work.
 ## Notes
 
 - Keep private SSH keys outside this repository.
-- Checked-in repo policy lives at `.codex/plugin-profile.yaml`.
+- Checked-in repo policy lives at `.codex/plugin-profile.yaml` or `.codex-plugin.yaml`.
 - Core behavior and maintenance scope are described in `SPEC.md`.

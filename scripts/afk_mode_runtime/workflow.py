@@ -517,13 +517,12 @@ def record_slice(
         run_command(
             ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{commit}^{{commit}}"]
         )
-        ancestry_check = run_command(
-            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", commit, f"refs/heads/{branch}"],
-            check=False,
-        )
-        if ancestry_check.returncode != 0:
+        branch_tip = run_command(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", f"refs/heads/{branch}"]
+        ).stdout.strip()
+        if branch_tip != commit:
             raise AfkModeError(
-                f"Successful slice commit {commit} is not contained in branch {branch}."
+                f"Successful slice commit {commit} must match the tip of branch {branch}."
             )
         verification_result = load_verification_result(run_dir, slice_id)
         if not verification_result.get("all_passed"):
@@ -543,6 +542,15 @@ def record_slice(
         if verification_result.get("verification_source") != payload.get("verification_source"):
             raise AfkModeError(
                 "Verification result artifact does not match the run verification source."
+            )
+        if verification_result.get("verified_head") != commit:
+            raise AfkModeError(
+                "Recorded commit does not match the commit that was verified."
+            )
+        proof_branch = verification_result.get("verified_branch")
+        if proof_branch is not None and proof_branch != branch:
+            raise AfkModeError(
+                "Recorded branch does not match the branch captured in the verification artifact."
             )
         if verification_commands and verification_commands != proof_commands:
             raise AfkModeError(

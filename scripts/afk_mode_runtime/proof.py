@@ -144,7 +144,9 @@ def _diff_name_status(worktree_path: Path, base_ref: str) -> list[dict[str, Any]
 
 
 def _fallback_path_violation(relative_path: str) -> str | None:
-    normalized = relative_path.replace("\\", "/").lstrip("./")
+    normalized = relative_path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     path = Path(normalized)
     if path.name in FALLBACK_BLOCKED_EXACT_NAMES:
         return f"fallback write mode does not allow modifying {path.name}"
@@ -346,6 +348,15 @@ def verify_slice(
         worktree_path=worktree_path,
         fallback_changed_paths=fallback_changed_paths,
     )
+    verified_head = run_command(
+        ["git", "-C", str(worktree_path), "rev-parse", "HEAD"]
+    ).stdout.strip()
+    verified_branch_result = subprocess.run(
+        ["git", "-C", str(worktree_path), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+    )
+    verified_branch = verified_branch_result.stdout.strip() or None
     artifact_dir = verification_artifact_dir(run_dir, slice_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -387,6 +398,8 @@ def verify_slice(
         "verified_at": now_utc(),
         "repo_root": payload["repo_root"],
         "worktree": str(worktree_path),
+        "verified_head": verified_head,
+        "verified_branch": verified_branch,
         "policy_source": policy["policy_source"],
         "verification_source": policy["verification_source"],
         "write_mode": load_run_write_mode(payload),

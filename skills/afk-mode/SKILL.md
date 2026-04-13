@@ -51,7 +51,7 @@ to narrate or wait unless the runtime reports a concrete blocker.
 After you have the budget, call the helper's auto-start entrypoint first:
 
 ```bash
-python3 ../../scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
+python3 scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
 ```
 
 `begin-run` does one of two things:
@@ -67,7 +67,7 @@ If the repo is dirty and the user confirms branching from committed `HEAD`,
 retry with:
 
 ```bash
-python3 ../../scripts/afk_mode.py begin-run \
+python3 scripts/afk_mode.py begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --ack-dirty-head-baseline
@@ -77,7 +77,7 @@ If the repo has no checked-in write-capable policy but `begin-run` reports
 `fallback_write_approval_required`, retry with:
 
 ```bash
-python3 ../../scripts/afk_mode.py begin-run \
+python3 scripts/afk_mode.py begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --allow-fallback-write
@@ -91,7 +91,7 @@ you need extra context for slice ranking:
 Run the helper script first:
 
 ```bash
-python3 ../../scripts/afk_mode.py discover --cwd "$PWD"
+python3 scripts/afk_mode.py discover --cwd "$PWD"
 ```
 
 This returns JSON with:
@@ -124,7 +124,7 @@ fallback write mode. Prefer checked-in repo policy first by either:
 - bootstrapping a reviewed local overlay:
 
 ```bash
-python3 ../../scripts/afk_mode.py bootstrap-profile \
+python3 scripts/afk_mode.py bootstrap-profile \
   --cwd "$PWD"
 ```
 
@@ -155,7 +155,7 @@ changes, and ask whether to continue or stop after candidate ranking. If the
 user confirms, pass the explicit acknowledgement flag when starting the run:
 
 ```bash
-python3 ../../scripts/afk_mode.py begin-run \
+python3 scripts/afk_mode.py begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --ack-dirty-head-baseline
@@ -166,7 +166,7 @@ python3 ../../scripts/afk_mode.py begin-run \
 Create a run directory under `~/.codex/afk-runs/`:
 
 ```bash
-python3 ../../scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
+python3 scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
 ```
 
 Prefer `begin-run` as the default operator entrypoint. `start-run` still exists
@@ -238,7 +238,7 @@ refuses to open a slice until the ranked shortlist has been written.
 If you want a quick advisory ETA before opening anything:
 
 ```bash
-python3 ../../scripts/afk_mode.py estimate-candidates --run-dir "$RUN_DIR"
+python3 scripts/afk_mode.py estimate-candidates --run-dir "$RUN_DIR"
 ```
 
 ### 6. Open A Slice Worktree
@@ -248,7 +248,7 @@ Never write directly on the active user branch.
 For each chosen slice:
 
 ```bash
-python3 ../../scripts/afk_mode.py open-slice \
+python3 scripts/afk_mode.py open-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --ordinal 1 \
@@ -277,7 +277,7 @@ The helper refuses to open a new slice when:
 Use status whenever you need a concise checkpoint:
 
 ```bash
-python3 ../../scripts/afk_mode.py status --run-dir "$RUN_DIR"
+python3 scripts/afk_mode.py status --run-dir "$RUN_DIR"
 ```
 
 This reports:
@@ -295,7 +295,7 @@ This reports:
 When a slice passes verification:
 
 ```bash
-python3 ../../scripts/afk_mode.py verify-slice \
+python3 scripts/afk_mode.py verify-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID"
 ```
@@ -304,7 +304,7 @@ This stores a machine-readable proof artifact under `logs/verification/` for the
 slice. Then record success:
 
 ```bash
-python3 ../../scripts/afk_mode.py record-slice \
+python3 scripts/afk_mode.py record-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --status success \
@@ -327,7 +327,7 @@ The helper now rejects `--status success` unless it has:
 Then remove closed worktrees owned by the run:
 
 ```bash
-python3 ../../scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
+python3 scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
 ```
 
 ### 9. Record Failure And Continue
@@ -335,7 +335,7 @@ python3 ../../scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
 When a slice fails implementation or verification:
 
 ```bash
-python3 ../../scripts/afk_mode.py save-patch \
+python3 scripts/afk_mode.py save-patch \
   --run-dir "$RUN_DIR" \
   --repo-root "$WORKTREE" \
   --output "$RUN_DIR/patches/$SLICE_ID.patch" \
@@ -348,7 +348,7 @@ only into that run's `patches/` directory.
 Then:
 
 ```bash
-python3 ../../scripts/afk_mode.py record-slice \
+python3 scripts/afk_mode.py record-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --status failed \
@@ -361,7 +361,7 @@ python3 ../../scripts/afk_mode.py record-slice \
 Then cleanup:
 
 ```bash
-python3 ../../scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
+python3 scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
 ```
 
 ### 10. Finish The Run
@@ -376,7 +376,7 @@ Stop when any of the following is true:
 Finish the run with:
 
 ```bash
-python3 ../../scripts/afk_mode.py finish-run \
+python3 scripts/afk_mode.py finish-run \
   --run-dir "$RUN_DIR" \
   --status completed \
   --summary "High-signal summary of completed, failed, and skipped slices"
@@ -411,7 +411,7 @@ triggered `rule_id` and required approval scope.
 For `rule_for_run` approval:
 
 ```bash
-python3 ../../scripts/afk_mode.py approve-guardrail \
+python3 scripts/afk_mode.py approve-guardrail \
   --run-dir "$RUN_DIR" \
   --rule-id "<rule-id>" \
   --reason "user approved ask-first guardrail"
@@ -420,7 +420,7 @@ python3 ../../scripts/afk_mode.py approve-guardrail \
 For `exact_command_once` approval:
 
 ```bash
-python3 ../../scripts/afk_mode.py approve-guardrail \
+python3 scripts/afk_mode.py approve-guardrail \
   --run-dir "$RUN_DIR" \
   --rule-id "<rule-id>" \
   --approved-command "<exact bash command>" \

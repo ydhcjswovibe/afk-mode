@@ -118,8 +118,9 @@ def _guardrail_label(rule: dict[str, Any]) -> str:
 
 
 def _approval_command(run_dir: str, rule: dict[str, Any], command: str) -> str:
+    helper_path = Path(__file__).resolve().parents[1] / "afk_mode.py"
     base = (
-        "python3 ../../scripts/afk_mode.py approve-guardrail "
+        f"python3 {shlex.quote(str(helper_path))} approve-guardrail "
         f"--run-dir {shlex.quote(run_dir)} "
         f"--rule-id {shlex.quote(str(rule['id']))} "
     )

@@ -61,11 +61,15 @@ def load_active_runs(run_root: Path) -> dict[str, Any]:
         return {"updated_at": None, "runs": {}}
     try:
         payload = json_load(path)
-    except json.JSONDecodeError:
-        return {"updated_at": None, "runs": {}}
+    except json.JSONDecodeError as exc:
+        raise AfkModeError(f"Active run registry is corrupted: {path}") from exc
     if not isinstance(payload, dict):
-        return {"updated_at": None, "runs": {}}
-    payload.setdefault("runs", {})
+        raise AfkModeError(f"Active run registry must contain a top-level object: {path}")
+    runs = payload.get("runs")
+    if runs is None:
+        payload["runs"] = {}
+    elif not isinstance(runs, dict):
+        raise AfkModeError(f"Active run registry field 'runs' must be an object: {path}")
     return payload
 
 
