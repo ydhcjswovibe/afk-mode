@@ -679,6 +679,42 @@ class AfkModeRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(afk_mode.AfkModeError, "Active run registry is corrupted"):
             afk_mode.start_run(repo, "45m", self.run_root)
 
+    def test_registry_missing_runs_field_is_treated_as_corruption(self) -> None:
+        repo = self.init_repo()
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        registry_path = self.run_root / "active-runs.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(
+            json.dumps({"updated_at": None}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "missing required field 'runs'"):
+            afk_mode.start_run(repo, "45m", self.run_root)
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "missing required field 'runs'"):
+            afk_mode.build_session_context(repo, run_root=self.run_root)
+
+    def test_registry_null_runs_field_is_treated_as_corruption(self) -> None:
+        repo = self.init_repo()
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        registry_path = self.run_root / "active-runs.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(
+            json.dumps({"updated_at": None, "runs": None}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "field 'runs' must be an object"):
+            afk_mode.start_run(repo, "45m", self.run_root)
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "field 'runs' must be an object"):
+            afk_mode.build_session_context(repo, run_root=self.run_root)
+
     def test_start_run_rejects_dirty_repo_without_acknowledgement(self) -> None:
         repo = self.init_repo()
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -2027,6 +2063,14 @@ class AfkModeRuntimeTest(unittest.TestCase):
             {"cwd": str(self.root)},
         )
         self.assertEqual(stop_result.stdout.strip(), "")
+
+    def test_skill_commands_reference_deployed_plugin_helper(self) -> None:
+        skill_path = Path(__file__).resolve().parents[1] / "skills" / "afk-mode" / "SKILL.md"
+        content = skill_path.read_text(encoding="utf-8")
+
+        self.assertIn("/home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py", content)
+        self.assertNotIn("python3 scripts/afk_mode.py", content)
+        self.assertNotIn("python3 ../../scripts/afk_mode.py", content)
 
     def test_hook_script_payload_contracts_are_stable(self) -> None:
         repo = self.init_repo("hook-contracts")

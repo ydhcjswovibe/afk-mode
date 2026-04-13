@@ -65,10 +65,10 @@ def load_active_runs(run_root: Path) -> dict[str, Any]:
         raise AfkModeError(f"Active run registry is corrupted: {path}") from exc
     if not isinstance(payload, dict):
         raise AfkModeError(f"Active run registry must contain a top-level object: {path}")
+    if "runs" not in payload:
+        raise AfkModeError(f"Active run registry is missing required field 'runs': {path}")
     runs = payload.get("runs")
-    if runs is None:
-        payload["runs"] = {}
-    elif not isinstance(runs, dict):
+    if not isinstance(runs, dict):
         raise AfkModeError(f"Active run registry field 'runs' must be an object: {path}")
     return payload
 
