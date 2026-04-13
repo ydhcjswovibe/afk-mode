@@ -15,9 +15,10 @@ from .common import (
 from .discovery import bootstrap_profile, discover_repo
 from .estimation import estimate_candidates
 from .guardrails import pretool_decision
+from .kernel_run import cleanup_run, finish_run, save_patch
 from .proof import verification_result_path, verify_slice
 from .run_state import approve_guardrail, build_session_context, load_run, save_run, status
-from .workflow import begin_run, cleanup_run, finish_run, open_slice, record_slice, save_patch, start_run
+from .workflow import begin_run, open_slice, record_slice, start_run
 
 __all__ = [
     "CANDIDATES_PLACEHOLDER",

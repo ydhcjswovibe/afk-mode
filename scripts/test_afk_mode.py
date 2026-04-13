@@ -9,8 +9,11 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import afk_mode
+import afk_mode_runtime
+import afk_mode_runtime.kernel_run as kernel_run
 import yaml
 
 
@@ -172,6 +175,34 @@ class AfkModeRuntimeTest(unittest.TestCase):
             return {"hooks": {}}
         return json.loads(self.hooks_path.read_text(encoding="utf-8"))
 
+    def assert_begin_run_blocker_contract(self, payload: dict[str, object]) -> None:
+        self.assertEqual(
+            set(payload),
+            {"started", "blocked", "blocker_code", "reason", "next_action", "recovery", "discovery"},
+        )
+        self.assertFalse(payload["started"])
+        self.assertTrue(payload["blocked"])
+        self.assertEqual(
+            set(payload["recovery"]),
+            {
+                "existing_run_id",
+                "existing_run_dir",
+                "existing_run_status",
+                "existing_active_slice_id",
+                "existing_active_branch",
+                "existing_active_worktree",
+                "existing_remaining_seconds",
+                "required_approval_type",
+                "required_repo_policy_source",
+                "current_repo_policy_source",
+                "current_write_mode",
+                "current_write_authorized",
+                "current_verification_source",
+                "required_verification_route",
+                "suggested_profile_path",
+            },
+        )
+
     def test_discover_non_repo_returns_candidates(self) -> None:
         base = self.root / "projects"
         base.mkdir()
@@ -243,6 +274,42 @@ class AfkModeRuntimeTest(unittest.TestCase):
 
         for name in expected:
             self.assertTrue(hasattr(afk_mode, name), name)
+
+    def test_runtime_package_exports_exact_surface(self) -> None:
+        expected = {
+            "CANDIDATES_PLACEHOLDER",
+            "CHECKED_IN_PROFILE_RELATIVE_PATHS",
+            "DEFAULT_PROFILE_ROOT",
+            "DEFAULT_RUN_ROOT",
+            "SUPPORTED_CAPABILITIES",
+            "TRUST_MODE_ASSISTIVE",
+            "TRUST_MODE_OBSERVE_ONLY",
+            "TRUST_MODE_TRUSTED",
+            "TRUST_MODES",
+            "AfkModeError",
+            "approve_guardrail",
+            "begin_run",
+            "bootstrap_profile",
+            "build_session_context",
+            "cleanup_run",
+            "default_profile_path",
+            "discover_repo",
+            "estimate_candidates",
+            "finish_run",
+            "load_run",
+            "open_slice",
+            "pretool_decision",
+            "record_slice",
+            "relative_to",
+            "save_patch",
+            "save_run",
+            "start_run",
+            "status",
+            "verification_result_path",
+            "verify_slice",
+        }
+        self.assertEqual(set(afk_mode_runtime.__all__), expected)
+        self.assertEqual({name for name in expected if hasattr(afk_mode_runtime, name)}, expected)
 
     def test_facade_cli_discover_smoke(self) -> None:
         repo = self.init_repo()
@@ -702,6 +769,71 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertEqual(result["recovery"]["existing_run_dir"], started["run_dir"])
         self.assertGreaterEqual(result["recovery"]["existing_remaining_seconds"], 0)
 
+    def test_begin_run_blocker_payload_contract_is_stable(self) -> None:
+        dirty_repo = self.init_repo("dirty-repo")
+        (dirty_repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(dirty_repo)
+        self.commit_paths(
+            dirty_repo,
+            "SPEC.md",
+            ".codex/plugin-profile.yaml",
+            message="Add checked-in profile",
+        )
+        (dirty_repo / "tracked.txt").write_text("dirty change\n", encoding="utf-8")
+
+        dirty_result = afk_mode.begin_run(dirty_repo, "30m", self.run_root)
+        self.assert_begin_run_blocker_contract(dirty_result)
+        self.assertEqual(dirty_result["blocker_code"], "dirty_head_ack_required")
+
+        fallback_repo = self.init_repo("fallback-repo")
+        (fallback_repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        (fallback_repo / "scripts").mkdir()
+        (fallback_repo / "scripts" / "verify_change.py").write_text("print('ok')\n", encoding="utf-8")
+        self.commit_paths(
+            fallback_repo,
+            "SPEC.md",
+            "scripts/verify_change.py",
+            message="Add fallback signals",
+        )
+
+        fallback_result = afk_mode.begin_run(fallback_repo, "30m", self.run_root)
+        self.assert_begin_run_blocker_contract(fallback_result)
+        self.assertEqual(fallback_result["blocker_code"], "fallback_write_approval_required")
+
+        profile_repo = self.init_repo("profile-repo")
+        (profile_repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(profile_repo, allow_isolated_write=False)
+        self.commit_paths(
+            profile_repo,
+            "SPEC.md",
+            ".codex/plugin-profile.yaml",
+            message="Add checked-in profile without isolated write",
+        )
+
+        profile_result = afk_mode.begin_run(
+            profile_repo,
+            "30m",
+            self.run_root,
+            allow_fallback_write=True,
+        )
+        self.assert_begin_run_blocker_contract(profile_result)
+        self.assertEqual(profile_result["blocker_code"], "profile_required")
+
+        active_repo = self.init_repo("active-repo")
+        (active_repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(active_repo)
+        self.commit_paths(
+            active_repo,
+            "SPEC.md",
+            ".codex/plugin-profile.yaml",
+            message="Add checked-in profile",
+        )
+        afk_mode.start_run(active_repo, "30m", self.run_root)
+
+        active_result = afk_mode.begin_run(active_repo, "30m", self.run_root)
+        self.assert_begin_run_blocker_contract(active_result)
+        self.assertEqual(active_result["blocker_code"], "active_run_exists")
+
     def test_checked_in_profile_caps_overlay_write_capability(self) -> None:
         repo = self.init_repo()
         overlay_root = self.root / "overlay-profiles"
@@ -1082,6 +1214,34 @@ class AfkModeRuntimeTest(unittest.TestCase):
         afk_mode.finish_run(Path(first["run_dir"]), "completed", "First run closed")
         second = afk_mode.start_run(repo, "45m", self.run_root)
         self.assertNotEqual(first["run_id"], second["run_id"])
+
+    def test_save_run_and_register_cleans_up_run_dir_when_registration_fails(self) -> None:
+        repo = self.init_repo("register-failure")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        discovery = afk_mode.discover_repo(repo)
+        run_id, run_dir = kernel_run.create_run_artifacts(self.run_root, discovery)
+
+        with mock.patch.object(
+            kernel_run,
+            "register_active_run",
+            side_effect=afk_mode.AfkModeError("registration failed"),
+        ):
+            with self.assertRaisesRegex(afk_mode.AfkModeError, "registration failed"):
+                kernel_run.save_run_and_register(
+                    self.run_root,
+                    repo,
+                    run_dir,
+                    {
+                        "run_id": run_id,
+                        "repo_root": str(repo),
+                    },
+                )
+
+        self.assertFalse(run_dir.exists())
+        self.assertFalse(self.hooks_path.exists())
 
     def test_start_open_status_record_finish_and_cleanup(self) -> None:
         repo = self.init_repo()
@@ -1742,6 +1902,61 @@ class AfkModeRuntimeTest(unittest.TestCase):
             {"cwd": str(repo), "stop_hook_active": True},
         )
         reentrant_payload = json.loads(reentrant_result.stdout)
+        self.assertTrue(reentrant_payload["continue"])
+
+    def test_hook_script_payload_contracts_are_stable(self) -> None:
+        repo = self.init_repo("hook-contracts")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+        started = afk_mode.start_run(repo, "45m", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.rank_candidates(run_dir, slice_id="slice-contracts")
+        afk_mode.open_slice(run_dir, "slice-contracts", 1, "contracts")
+
+        plugin_root = Path(__file__).resolve().parents[1]
+        session_payload = json.loads(
+            self.run_plugin_script(
+                plugin_root / "hooks" / "session_start.py",
+                {"cwd": str(repo), "source": "startup"},
+            ).stdout
+        )
+        self.assertEqual(set(session_payload), {"hookSpecificOutput"})
+        self.assertEqual(
+            set(session_payload["hookSpecificOutput"]),
+            {"hookEventName", "additionalContext"},
+        )
+        self.assertEqual(session_payload["hookSpecificOutput"]["hookEventName"], "SessionStart")
+
+        pretool_payload = json.loads(
+            self.run_plugin_script(
+                plugin_root / "hooks" / "pre_tool_use.py",
+                {"cwd": str(repo), "tool_input": {"command": "git reset --hard HEAD"}},
+            ).stdout
+        )
+        self.assertEqual(set(pretool_payload), {"hookSpecificOutput", "systemMessage"})
+        self.assertEqual(
+            set(pretool_payload["hookSpecificOutput"]),
+            {"hookEventName", "permissionDecision", "permissionDecisionReason"},
+        )
+        self.assertEqual(pretool_payload["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+
+        stop_payload = json.loads(
+            self.run_plugin_script(
+                plugin_root / "hooks" / "stop_guard.py",
+                {"cwd": str(repo)},
+            ).stdout
+        )
+        self.assertEqual(set(stop_payload), {"decision", "reason"})
+        self.assertEqual(stop_payload["decision"], "block")
+
+        reentrant_payload = json.loads(
+            self.run_plugin_script(
+                plugin_root / "hooks" / "stop_guard.py",
+                {"cwd": str(repo), "stop_hook_active": True},
+            ).stdout
+        )
+        self.assertEqual(set(reentrant_payload), {"continue"})
         self.assertTrue(reentrant_payload["continue"])
 
 

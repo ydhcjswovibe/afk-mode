@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import shutil
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -15,16 +13,13 @@ from .common import (
     WRITE_MODE_NONE,
     WRITE_MODE_REPO_OWNED,
     default_profile_path,
-    json_dump,
     checked_in_profile_candidates,
     now_utc,
     parse_duration_seconds,
     relative_to,
     run_command,
     sha256_text,
-    slugify,
     write_text_atomic,
-    is_within,
     TRUST_MODE_OBSERVE_ONLY,
 )
 from .discovery import discover_repo
@@ -34,15 +29,14 @@ from .estimation import (
     estimate_warning_for_slice,
     write_candidates_meta_stub,
 )
+from .kernel_run import create_run_artifacts, create_slice_worktree, save_run_and_register
 from .policy import request_capability
 from .proof import load_verification_result, verification_result_path
 from .run_state import (
     active_runs_path,
-    clear_active_run,
     elapsed_and_remaining_seconds,
     find_active_run_for_repo,
     load_run,
-    register_active_run,
     save_run,
 )
 
@@ -258,12 +252,6 @@ def begin_run(
         "discovery": discovery,
     }
 
-
-def build_run_id(repo_name: str) -> str:
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    return f"{timestamp}-{slugify(repo_name)}-{uuid.uuid4().hex[:8]}"
-
-
 def render_candidates_stub(run_id: str, discovery: dict[str, Any], budget: str) -> str:
     lines = [
         "# AFK Run Candidates",
@@ -340,14 +328,7 @@ def start_run(
             "to confirm slices should branch from committed HEAD instead."
         )
     budget_seconds = parse_duration_seconds(budget)
-    run_id = build_run_id(discovery["repo_name"])
-    run_dir = run_root / run_id
-    while run_dir.exists():
-        run_id = build_run_id(discovery["repo_name"])
-        run_dir = run_root / run_id
-    for name in ("logs", "patches", "worktrees"):
-        (run_dir / name).mkdir(parents=True, exist_ok=True)
-    json_dump(run_dir / "discovery.json", discovery)
+    run_id, run_dir = create_run_artifacts(run_root, discovery)
     candidates_stub_sha256 = write_candidates_stub(run_dir, discovery, budget)
 
     repo_root = Path(discovery["repo_root"])
@@ -403,12 +384,7 @@ def start_run(
         "slices": [],
         "summary": None,
     }
-    save_run(run_dir, run_payload)
-    try:
-        register_active_run(run_root, repo_root, run_dir, run_id)
-    except AfkModeError:
-        shutil.rmtree(run_dir, ignore_errors=True)
-        raise
+    save_run_and_register(run_root, repo_root, run_dir, run_payload)
     return {
         "run_id": run_id,
         "run_dir": str(run_dir),
@@ -444,13 +420,12 @@ def open_slice(run_dir: Path, slice_id: str, ordinal: int, slug: str | None) -> 
     elif CANDIDATES_PLACEHOLDER in current_candidates:
         raise AfkModeError("Rank slices in candidates.md before opening a worktree.")
 
-    safe_slug = slugify(slug or slice_id)
-    branch = f"afk/{payload['run_id']}/{ordinal:02d}-{safe_slug}"
-    worktree = run_dir / "worktrees" / f"{ordinal:02d}-{safe_slug}"
-    repo_root = Path(payload["repo_root"])
-    base_ref = payload["git_baseline"]["head"]
-    run_command(
-        ["git", "-C", str(repo_root), "worktree", "add", "-b", branch, str(worktree), base_ref]
+    branch, worktree, safe_slug = create_slice_worktree(
+        run_dir,
+        payload,
+        slice_id,
+        ordinal,
+        slug,
     )
     estimate = estimate_one_slice(
         run_dir,
@@ -652,100 +627,3 @@ def record_slice(
     save_run(run_dir, payload)
     append_terminal_sample(run_dir, payload, entry)
     return entry
-
-
-def finish_run(run_dir: Path, status_name: str, summary: str) -> dict[str, Any]:
-    payload = load_run(run_dir)
-    if payload.get("active_slice"):
-        raise AfkModeError("Cannot finish a run while an active slice is still open.")
-    payload["status"] = status_name
-    payload["finished_at"] = now_utc()
-    payload["summary"] = summary
-    save_run(run_dir, payload)
-    clear_active_run(run_dir.parent, Path(payload["repo_root"]), payload["run_id"])
-    return payload
-
-
-def validate_patch_capture(
-    run_dir: Path | None,
-    repo_root: Path,
-    output: Path,
-    include_untracked: bool,
-) -> None:
-    if run_dir is None:
-        raise AfkModeError(
-            "save-patch requires --run-dir so the active slice worktree and patch "
-            "destination can be verified."
-        )
-    payload = load_run(run_dir)
-    active = payload.get("active_slice")
-    if active is None:
-        raise AfkModeError("Cannot save a patch because the run has no active slice.")
-    expected_worktree = Path(active["worktree"]).resolve()
-    if repo_root.resolve() != expected_worktree:
-        raise AfkModeError(
-            f"Patch capture must target the active slice worktree: {expected_worktree}"
-        )
-    patches_dir = (run_dir / "patches").resolve()
-    if not is_within(output, patches_dir):
-        raise AfkModeError(
-            f"Patch output must stay under the run patches directory: {patches_dir}"
-        )
-
-
-def save_patch(
-    repo_root: Path,
-    output: Path,
-    include_untracked: bool,
-    run_dir: Path | None = None,
-) -> dict[str, Any]:
-    validate_patch_capture(run_dir, repo_root, output, include_untracked)
-    if include_untracked:
-        run_command(["git", "-C", str(repo_root), "add", "--intent-to-add", "--all"])
-    diff = run_command(["git", "-C", str(repo_root), "diff", "--binary", "HEAD"]).stdout
-    if not diff:
-        raise AfkModeError("No changes found to save as a patch.")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(diff, encoding="utf-8")
-    return {
-        "output": str(output),
-        "bytes": output.stat().st_size,
-        "include_untracked": include_untracked,
-        "run_dir": str(run_dir) if run_dir else None,
-    }
-
-
-def cleanup_run(run_dir: Path) -> dict[str, Any]:
-    payload = load_run(run_dir)
-    repo_root = Path(payload["repo_root"])
-    worktrees_dir = run_dir / "worktrees"
-    if not worktrees_dir.exists():
-        return {"removed": [], "skipped": [], "failed": []}
-    active_worktree = None
-    if payload.get("active_slice"):
-        active_worktree = Path(payload["active_slice"]["worktree"])
-
-    removed: list[str] = []
-    skipped: list[str] = []
-    failed: list[dict[str, Any]] = []
-    for worktree in sorted(worktrees_dir.iterdir()):
-        if not worktree.exists():
-            continue
-        if active_worktree and worktree == active_worktree:
-            skipped.append(str(worktree))
-            continue
-        result = run_command(
-            ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
-            check=False,
-        )
-        if result.returncode == 0:
-            removed.append(str(worktree))
-            continue
-        if worktree.exists():
-            failed.append(
-                {
-                    "worktree": str(worktree),
-                    "reason": result.stderr.strip() or result.stdout.strip() or "unknown",
-                }
-            )
-    return {"removed": removed, "skipped": skipped, "failed": failed}
