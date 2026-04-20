@@ -118,12 +118,20 @@ def _guardrail_label(rule: dict[str, Any]) -> str:
 
 
 def _approval_command(run_dir: str, rule: dict[str, Any], command: str) -> str:
-    helper_path = Path(__file__).resolve().parents[1] / "afk_mode.py"
-    base = (
-        f"python3 {shlex.quote(str(helper_path))} approve-guardrail "
-        f"--run-dir {shlex.quote(run_dir)} "
-        f"--rule-id {shlex.quote(str(rule['id']))} "
-    )
+    wrapper_path = Path(__file__).resolve().parents[2] / "afk-mode"
+    if wrapper_path.exists():
+        base = (
+            f"{shlex.quote(str(wrapper_path))} approve-guardrail "
+            f"--run-dir {shlex.quote(run_dir)} "
+            f"--rule-id {shlex.quote(str(rule['id']))} "
+        )
+    else:
+        helper_path = Path(__file__).resolve().parents[1] / "afk_mode.py"
+        base = (
+            f"python3 {shlex.quote(str(helper_path))} approve-guardrail "
+            f"--run-dir {shlex.quote(run_dir)} "
+            f"--rule-id {shlex.quote(str(rule['id']))} "
+        )
     if rule.get("approval_scope") == GUARDRAIL_APPROVAL_SCOPE_EXACT_COMMAND_ONCE:
         base += f"--approved-command {shlex.quote(command)} "
     base += '--reason "user approved ask-first guardrail"'

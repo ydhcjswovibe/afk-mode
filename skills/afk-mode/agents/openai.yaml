@@ -1,7 +1,7 @@
 interface:
   display_name: "AFK Mode"
   short_description: "Budgeted repo automation with branch isolation"
-  default_prompt: "Use $afk-mode to inspect the current repo, ask for a runtime budget, rank safe slices, and execute them on isolated slice branches."
+  default_prompt: "Use $afk-mode <budget> as the public entrypoint for bounded repo automation. Treat begin-run and advance-run as internal helpers, not user-facing steps."
 
 policy:
   allow_implicit_invocation: false

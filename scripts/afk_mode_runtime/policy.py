@@ -403,6 +403,14 @@ def resolve_fallback_verification_route(signals: dict[str, Any]) -> list[str]:
     return _generic_verification_route(signals)
 
 
+def _fallback_truth_ready(signals: dict[str, Any]) -> bool:
+    truth_order = normalize_str_list(
+        signals.get("truth_order"),
+        "signals truth_order",
+    )
+    return any(source != "AGENTS.md" for source in truth_order)
+
+
 def resolve_write_mode(
     checked_in_profile: dict[str, Any] | None,
     merged_profile: dict[str, Any] | None,
@@ -420,7 +428,7 @@ def resolve_write_mode(
         return WRITE_MODE_REPO_OWNED, True
     fallback_available = (
         checked_in_profile is None
-        and bool(signals.get("truth_order"))
+        and _fallback_truth_ready(signals)
         and verification_source == VERIFICATION_SOURCE_FALLBACK
     )
     if fallback_available:

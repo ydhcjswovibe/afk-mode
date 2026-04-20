@@ -5,6 +5,7 @@ import datetime as dt
 import fcntl
 import json
 import shlex
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -62,20 +63,85 @@ def load_active_runs(run_root: Path) -> dict[str, Any]:
     try:
         payload = json_load(path)
     except json.JSONDecodeError as exc:
-        raise AfkModeError(f"Active run registry is corrupted: {path}") from exc
+        raise AfkModeError(
+            f"Active run registry is corrupted: {path}. "
+            "Use the AFK Mode repair-registry command to recover."
+        ) from exc
     if not isinstance(payload, dict):
-        raise AfkModeError(f"Active run registry must contain a top-level object: {path}")
+        raise AfkModeError(
+            f"Active run registry must contain a top-level object: {path}. "
+            "Use the AFK Mode repair-registry command to recover."
+        )
     if "runs" not in payload:
-        raise AfkModeError(f"Active run registry is missing required field 'runs': {path}")
+        raise AfkModeError(
+            f"Active run registry is missing required field 'runs': {path}. "
+            "Use the AFK Mode repair-registry command to recover."
+        )
     runs = payload.get("runs")
     if not isinstance(runs, dict):
-        raise AfkModeError(f"Active run registry field 'runs' must be an object: {path}")
+        raise AfkModeError(
+            f"Active run registry field 'runs' must be an object: {path}. "
+            "Use the AFK Mode repair-registry command to recover."
+        )
     return payload
 
 
 def save_active_runs(run_root: Path, payload: dict[str, Any]) -> None:
     payload["updated_at"] = now_utc()
     json_dump(active_runs_path(run_root), payload)
+
+
+def repair_active_runs(run_root: Path, *, reset_corrupt: bool = False) -> dict[str, Any]:
+    path = active_runs_path(run_root)
+    with active_runs_lock(run_root):
+        if not path.exists():
+            payload = {"updated_at": None, "runs": {}}
+            save_active_runs(run_root, payload)
+            sync_afk_hooks(run_root, enabled=False)
+            return {
+                "path": str(path),
+                "status": "initialized_empty",
+                "backup": None,
+                "preserved_runs": 0,
+                "removed_repo_roots": [],
+            }
+
+        try:
+            payload = load_active_runs(run_root)
+        except AfkModeError:
+            if not reset_corrupt:
+                raise
+            timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            backup_path = path.with_name(f"{path.name}.corrupt-{timestamp}.bak")
+            shutil.copy2(path, backup_path)
+            payload = {"updated_at": None, "runs": {}}
+            save_active_runs(run_root, payload)
+            sync_afk_hooks(run_root, enabled=False)
+            return {
+                "path": str(path),
+                "status": "reset_corrupt",
+                "backup": str(backup_path),
+                "preserved_runs": 0,
+                "removed_repo_roots": [],
+            }
+
+        removed_repo_roots: list[str] = []
+        for repo_root_str in list(payload["runs"]):
+            previous_entry = payload["runs"].get(repo_root_str)
+            current_entry = _running_entry_for_repo(payload, Path(repo_root_str))
+            if previous_entry is not None and current_entry is None:
+                removed_repo_roots.append(repo_root_str)
+
+        if removed_repo_roots:
+            save_active_runs(run_root, payload)
+        sync_afk_hooks(run_root, enabled=bool(payload["runs"]))
+        return {
+            "path": str(path),
+            "status": "pruned" if removed_repo_roots else "clean",
+            "backup": None,
+            "preserved_runs": len(payload["runs"]),
+            "removed_repo_roots": removed_repo_roots,
+        }
 
 
 def load_run(run_dir: Path) -> dict[str, Any]:
@@ -460,6 +526,25 @@ def elapsed_and_remaining_seconds(run_payload: dict[str, Any]) -> tuple[int, int
     return elapsed, remaining
 
 
+def heartbeat_age_seconds(run_payload: dict[str, Any]) -> int | None:
+    heartbeat_at = parse_timestamp(run_payload.get("heartbeat_at"))
+    if heartbeat_at is None:
+        return None
+    return max(0, int((dt.datetime.now(dt.timezone.utc) - heartbeat_at).total_seconds()))
+
+
+def is_run_stale(run_payload: dict[str, Any]) -> bool:
+    if not run_payload.get("active_slice"):
+        return False
+    stale_after = run_payload.get("stale_after")
+    if not isinstance(stale_after, int) or isinstance(stale_after, bool) or stale_after <= 0:
+        return False
+    heartbeat_age = heartbeat_age_seconds(run_payload)
+    if heartbeat_age is None:
+        return False
+    return heartbeat_age >= stale_after
+
+
 def status(run_dir: Path) -> dict[str, Any]:
     payload = load_run(run_dir)
     elapsed, remaining = elapsed_and_remaining_seconds(payload)
@@ -468,6 +553,17 @@ def status(run_dir: Path) -> dict[str, Any]:
         "status": payload["status"],
         "repo_root": payload["repo_root"],
         "trust_mode": payload.get("trust_mode", TRUST_MODE_TRUSTED),
+        "wake_policy": payload.get("wake_policy"),
+        "planning_budget_ratio": payload.get("planning_budget_ratio"),
+        "verification_reserve_ratio": payload.get("verification_reserve_ratio"),
+        "phase": payload.get("phase"),
+        "controller_state": payload.get("controller_state"),
+        "heartbeat_at": payload.get("heartbeat_at"),
+        "stale_after": payload.get("stale_after"),
+        "stale": is_run_stale(payload),
+        "resume_policy": payload.get("resume_policy"),
+        "consecutive_failures": payload.get("consecutive_failures", 0),
+        "last_blocker": payload.get("last_blocker"),
         "elapsed_seconds": elapsed,
         "remaining_seconds": remaining,
         "active_slice": payload.get("active_slice"),
@@ -557,6 +653,9 @@ def build_session_context(cwd: Path, run_root: Path = DEFAULT_RUN_ROOT) -> dict[
         "repo_root": run_payload["repo_root"],
         "repo_name": run_payload["repo_name"],
         "trust_mode": run_payload.get("trust_mode", TRUST_MODE_TRUSTED),
+        "wake_policy": run_payload.get("wake_policy"),
+        "planning_budget_ratio": run_payload.get("planning_budget_ratio"),
+        "verification_reserve_ratio": run_payload.get("verification_reserve_ratio"),
         "policy_source": load_run_policy_source(run_payload),
         "write_mode": load_run_write_mode(run_payload),
         "write_authorized": load_run_write_authorized(run_payload),
@@ -564,6 +663,10 @@ def build_session_context(cwd: Path, run_root: Path = DEFAULT_RUN_ROOT) -> dict[
         "verification_route": load_run_verification_route(run_payload),
         "elapsed_seconds": elapsed,
         "remaining_seconds": remaining,
+        "phase": run_payload.get("phase"),
+        "controller_state": run_payload.get("controller_state"),
+        "heartbeat_at": run_payload.get("heartbeat_at"),
+        "stale": is_run_stale(run_payload),
         "active_slice": active,
         "completed_count": run_payload.get("completed_count", 0),
         "failed_count": run_payload.get("failed_count", 0),

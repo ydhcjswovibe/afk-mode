@@ -1,5 +1,6 @@
 from .common import (
     CANDIDATES_PLACEHOLDER,
+    CANDIDATES_QUEUE_FILENAME,
     CHECKED_IN_PROFILE_RELATIVE_PATHS,
     DEFAULT_PROFILE_ROOT,
     DEFAULT_RUN_ROOT,
@@ -12,16 +13,25 @@ from .common import (
     default_profile_path,
     relative_to,
 )
+from .controller import advance_run
 from .discovery import bootstrap_profile, discover_repo
 from .estimation import estimate_candidates
 from .guardrails import pretool_decision
 from .kernel_run import cleanup_run, finish_run, save_patch
 from .proof import verification_result_path, verify_slice
-from .run_state import approve_guardrail, build_session_context, load_run, save_run, status
+from .run_state import (
+    approve_guardrail,
+    build_session_context,
+    load_run,
+    repair_active_runs,
+    save_run,
+    status,
+)
 from .workflow import begin_run, open_slice, record_slice, start_run
 
 __all__ = [
     "CANDIDATES_PLACEHOLDER",
+    "CANDIDATES_QUEUE_FILENAME",
     "CHECKED_IN_PROFILE_RELATIVE_PATHS",
     "DEFAULT_PROFILE_ROOT",
     "DEFAULT_RUN_ROOT",
@@ -31,6 +41,7 @@ __all__ = [
     "TRUST_MODE_TRUSTED",
     "TRUST_MODES",
     "AfkModeError",
+    "advance_run",
     "approve_guardrail",
     "begin_run",
     "bootstrap_profile",
@@ -43,6 +54,7 @@ __all__ = [
     "load_run",
     "open_slice",
     "pretool_decision",
+    "repair_active_runs",
     "record_slice",
     "relative_to",
     "save_patch",

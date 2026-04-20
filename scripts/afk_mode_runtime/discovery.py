@@ -229,15 +229,21 @@ def detect_skill_metadata(repo_root: Path) -> dict[str, Any]:
 
 def build_repo_signals(repo_root: Path, design_docs: list[dict[str, Any]]) -> dict[str, Any]:
     package_scripts = load_package_scripts(repo_root)
+    workflow_roots = detect_workflow_state_roots(repo_root)
     truth_order: list[str] = []
     if (repo_root / "AGENTS.md").exists():
         truth_order.append("AGENTS.md")
     truth_order.extend(doc["relative_path"] for doc in design_docs)
+    truth_order.extend(
+        f"{root['relative_path']}/{root['status_glob']}"
+        for root in workflow_roots
+        if root.get("status_file_count", 0) > 0
+    )
     return {
         "fingerprint": repo_fingerprint(repo_root),
         "truth_order": unique_strings(truth_order),
         "workflow_state": {
-            "roots": detect_workflow_state_roots(repo_root),
+            "roots": workflow_roots,
             "execution_entrypoints": detect_execution_entrypoints(repo_root, package_scripts),
         },
         "verification": {
@@ -246,6 +252,30 @@ def build_repo_signals(repo_root: Path, design_docs: list[dict[str, Any]]) -> di
         },
         "skills": detect_skill_metadata(repo_root),
     }
+
+
+def truth_sources_from_context(
+    signals: dict[str, Any] | None,
+    repo_context: dict[str, Any] | None,
+) -> list[str]:
+    truth_sources: list[str] = []
+    if isinstance(repo_context, dict):
+        profile = repo_context.get("profile") or {}
+        truth = profile.get("truth") or {}
+        order = truth.get("order") or []
+        truth_sources.extend(
+            item.strip()
+            for item in order
+            if isinstance(item, str) and item.strip()
+        )
+    if isinstance(signals, dict):
+        truth_order = signals.get("truth_order") or []
+        truth_sources.extend(
+            item.strip()
+            for item in truth_order
+            if isinstance(item, str) and item.strip()
+        )
+    return unique_strings(truth_sources)
 
 
 def workflow_statuses(repo_root: Path) -> dict[str, Any]:
@@ -331,15 +361,17 @@ def nearby_repo_candidates(
             pass
         else:
             docs = detect_design_docs(repo_root)
-            if docs:
+            signals = build_repo_signals(repo_root, docs)
+            repo_context = build_repo_context(repo_root, signals, profile_root=profile_root)
+            truth_sources = truth_sources_from_context(signals, repo_context)
+            if truth_sources:
                 seen.add(repo_root)
-                signals = build_repo_signals(repo_root, docs)
-                repo_context = build_repo_context(repo_root, signals, profile_root=profile_root)
                 candidates.append(
                     {
                         "repo_root": str(repo_root),
                         "repo_name": repo_root.name,
                         "design_docs": docs[:3],
+                        "truth_sources": truth_sources[:5],
                         "trust_mode": repo_context["trust_mode"],
                         "checked_in_profile_path": repo_context["checked_in_profile_path"],
                     }
@@ -379,6 +411,7 @@ def discover_repo(
         if repo_root and signals
         else None
     )
+    truth_sources = truth_sources_from_context(signals, repo_context)
     capability_verdicts = (
         {
             capability: request_capability(
@@ -401,6 +434,7 @@ def discover_repo(
         "repo_root": str(repo_root) if repo_root else None,
         "repo_name": repo_root.name if repo_root else None,
         "design_docs": design_docs,
+        "truth_sources": truth_sources,
         "git": git_info(repo_root),
         "workflow": {
             "has_agents_md": (repo_root / "AGENTS.md").exists() if repo_root else False,

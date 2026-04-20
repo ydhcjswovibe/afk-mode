@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from .common import (
-    CANDIDATES_PLACEHOLDER,
     DEFAULT_PROFILE_ROOT,
     AfkModeError,
     VERIFICATION_SOURCE_NONE,
@@ -19,15 +18,23 @@ from .common import (
     relative_to,
     run_command,
     sha256_text,
-    write_text_atomic,
     TRUST_MODE_OBSERVE_ONLY,
 )
-from .discovery import discover_repo
+from .candidate_queue import (
+    build_initial_candidate_queue,
+    find_candidate_entry,
+    inspect_candidate_plan,
+    load_candidate_queue,
+    refresh_candidate_queue,
+    render_candidates_report,
+    upsert_candidate_entry,
+    write_candidates_artifacts,
+)
+from .discovery import discover_repo, truth_sources_from_context
 from .estimation import (
     append_terminal_sample,
     estimate_one_slice,
     estimate_warning_for_slice,
-    write_candidates_meta_stub,
 )
 from .kernel_run import create_run_artifacts, create_slice_worktree, save_run_and_register
 from .policy import request_capability
@@ -121,6 +128,13 @@ def _write_unavailable_reason(discovery: dict[str, Any], profile_root: Path) -> 
     )["reason"]
 
 
+def _discovery_truth_sources(discovery: dict[str, Any]) -> list[str]:
+    return truth_sources_from_context(
+        discovery.get("signals"),
+        discovery.get("repo_context"),
+    )
+
+
 def ensure_repo_run(
     discovery: dict[str, Any],
     *,
@@ -129,8 +143,8 @@ def ensure_repo_run(
 ) -> dict[str, Any]:
     if not discovery["git"]["is_repo"]:
         raise AfkModeError("AFK Mode can only start inside a git repository.")
-    if not discovery["design_docs"]:
-        raise AfkModeError("AFK Mode needs at least one credible design doc for this repo.")
+    if not _discovery_truth_sources(discovery):
+        raise AfkModeError("AFK Mode needs at least one credible repo truth source for this repo.")
     write_mode = discovery.get("write_mode") or WRITE_MODE_NONE
     if write_mode == WRITE_MODE_REPO_OWNED:
         return {
@@ -169,12 +183,12 @@ def begin_run(
             "AFK Mode can only start inside a git repository.",
             "Choose one nearby repo candidate and retry begin-run there.",
         )
-    if not discovery["design_docs"]:
+    if not _discovery_truth_sources(discovery):
         return _blocker_payload(
             discovery,
-            "missing_design_docs",
-            "AFK Mode needs at least one credible design doc for this repo.",
-            "Add or point to a credible design/spec document before retrying.",
+            "missing_repo_truth",
+            "AFK Mode needs at least one credible repo truth source for this repo.",
+            "Add or point to a credible design/spec, AGENTS.md, or repo workflow truth source before retrying.",
         )
 
     existing_run = find_active_run_for_repo(Path(discovery["repo_root"]), run_root=run_root)
@@ -253,57 +267,13 @@ def begin_run(
     }
 
 def render_candidates_stub(run_id: str, discovery: dict[str, Any], budget: str) -> str:
-    lines = [
-        "# AFK Run Candidates",
-        "",
-        f"- Run ID: `{run_id}`",
-        f"- Repo: `{discovery['repo_name']}`",
-        f"- Budget: `{budget}`",
-        f"- Trust Mode: `{discovery.get('trust_mode', TRUST_MODE_OBSERVE_ONLY)}`",
-        "",
-        "## Trusted Design Docs",
-        "",
-    ]
-    design_docs = discovery.get("design_docs", [])
-    if design_docs:
-        for doc in design_docs:
-            lines.append(
-                f"- `{doc['relative_path']}` ({doc['kind']}, priority {doc['priority']})"
-            )
-    else:
-        lines.append("- None detected")
-    lines.extend(
-        [
-            "",
-            "## Ranked Slices",
-            "",
-            CANDIDATES_PLACEHOLDER,
-            "",
-            "Use one compact block per slice:",
-            "",
-            "1. `slice-id`",
-            "   - Why it is in scope",
-            "   - Why it is safe overnight",
-            "   - Expected verification",
-            "   - Estimated difficulty",
-            "",
-            "Machine-readable estimate hints live in `candidates.meta.json`:",
-            "",
-            "{",
-            '  "slices": [',
-            '    {"slice_id": "slice-id", "size": "medium", "risk": "medium", "verify_cost": "medium"}',
-            "  ]",
-            "}",
-            "",
-        ]
-    )
-    return "\n".join(lines)
+    queue = build_initial_candidate_queue(discovery)
+    return render_candidates_report(run_id, discovery, budget, queue)
 
 
 def write_candidates_stub(run_dir: Path, discovery: dict[str, Any], budget: str) -> str:
-    content = render_candidates_stub(run_dir.name, discovery, budget)
-    write_text_atomic(run_dir / "candidates.md", content)
-    write_candidates_meta_stub(run_dir)
+    queue = build_initial_candidate_queue(discovery)
+    content = write_candidates_artifacts(run_dir, run_dir.name, discovery, budget, queue)
     return sha256_text(content)
 
 
@@ -329,7 +299,9 @@ def start_run(
         )
     budget_seconds = parse_duration_seconds(budget)
     run_id, run_dir = create_run_artifacts(run_root, discovery)
-    candidates_stub_sha256 = write_candidates_stub(run_dir, discovery, budget)
+    queue = build_initial_candidate_queue(discovery)
+    candidates_report = write_candidates_artifacts(run_dir, run_id, discovery, budget, queue)
+    candidates_stub_sha256 = sha256_text(candidates_report)
 
     repo_root = Path(discovery["repo_root"])
     repo_context = dict(discovery["repo_context"] or {})
@@ -353,6 +325,7 @@ def start_run(
         },
         "candidates_stub_sha256": candidates_stub_sha256,
         "design_docs": discovery["design_docs"],
+        "truth_sources": discovery.get("truth_sources") or _discovery_truth_sources(discovery),
         "workflow": discovery["workflow"],
         "repo_candidates": discovery["repo_candidates"],
         "repo_context": repo_context,
@@ -365,6 +338,13 @@ def start_run(
             if discovery.get("verification_source") == "repo_owned"
             else discovery.get("fallback_verification_route") or []
         ),
+        "phase": "planning",
+        "controller_state": "queued",
+        "heartbeat_at": now_utc(),
+        "stale_after": 1800,
+        "resume_policy": "fail_stale_active_slice",
+        "consecutive_failures": 0,
+        "last_blocker": None,
         "metrics_root": str(run_root.parent / "afk-metrics"),
         "trust_mode": discovery["trust_mode"],
         "capability_verdicts": discovery["capability_verdicts"],
@@ -372,12 +352,17 @@ def start_run(
         "artifacts": {
             "discovery": "discovery.json",
             "candidates": "candidates.md",
+            "candidate_queue": "candidates.json",
             "candidate_metadata": "candidates.meta.json",
+            "plans_dir": "plans",
             "logs_dir": "logs",
             "patches_dir": "patches",
             "worktrees_dir": "worktrees",
             "active_run_pointer": relative_to(active_runs_path(run_root), run_root),
         },
+        "wake_policy": "hard_blockers_only",
+        "planning_budget_ratio": 0.2,
+        "verification_reserve_ratio": 0.2,
         "active_slice": None,
         "completed_count": 0,
         "failed_count": 0,
@@ -408,17 +393,30 @@ def open_slice(run_dir: Path, slice_id: str, ordinal: int, slug: str | None) -> 
     _, remaining = elapsed_and_remaining_seconds(payload)
     if remaining <= 0:
         raise AfkModeError("Run budget is exhausted. Finish the run instead of opening a new slice.")
-
-    candidates_path = run_dir / "candidates.md"
-    if not candidates_path.exists():
-        raise AfkModeError("Run candidates.md is missing. Rank slices before opening a worktree.")
-    current_candidates = candidates_path.read_text(encoding="utf-8")
-    stub_hash = payload.get("candidates_stub_sha256")
-    if stub_hash:
-        if sha256_text(current_candidates) == stub_hash:
-            raise AfkModeError("Rank slices in candidates.md before opening a worktree.")
-    elif CANDIDATES_PLACEHOLDER in current_candidates:
-        raise AfkModeError("Rank slices in candidates.md before opening a worktree.")
+    queue = refresh_candidate_queue(run_dir)
+    _, candidate = find_candidate_entry(queue, slice_id)
+    if candidate is None:
+        raise AfkModeError(
+            f"Candidate '{slice_id}' was not found in candidates.json. Refresh the structured queue first."
+        )
+    if candidate.get("status") not in {"queued"}:
+        raise AfkModeError(
+            f"Candidate '{slice_id}' is not queued and cannot be opened from status '{candidate.get('status')}'."
+        )
+    workflow_evidence = candidate.get("workflow_evidence") or {}
+    if candidate.get("requires_workflow_token") and not workflow_evidence.get("validated"):
+        raise AfkModeError(
+            f"Candidate '{slice_id}' requires validated repo workflow evidence before AFK Mode can open it."
+        )
+    plan_state = inspect_candidate_plan(
+        run_dir,
+        slice_id,
+        plan_dir=candidate.get("plan_dir"),
+    )
+    if not plan_state.get("ready_for_execution"):
+        raise AfkModeError(
+            f"Candidate '{slice_id}' requires a frozen plan before AFK Mode can open it."
+        )
 
     branch, worktree, safe_slug = create_slice_worktree(
         run_dir,
@@ -442,6 +440,7 @@ def open_slice(run_dir: Path, slice_id: str, ordinal: int, slug: str | None) -> 
         "worktree": str(worktree),
         "ordinal": ordinal,
         "slug": safe_slug,
+        "title": candidate.get("title", slice_id),
         "opened_at": now_utc(),
         "remaining_seconds_at_open": remaining,
         "size": estimate["size"],
@@ -456,6 +455,24 @@ def open_slice(run_dir: Path, slice_id: str, ordinal: int, slug: str | None) -> 
         "estimate_reason": estimate["reason"],
         "estimate_warning": estimate_warning,
     }
+    upsert_candidate_entry(
+        run_dir,
+        slice_id=slice_id,
+        ordinal=ordinal,
+        title=str(candidate.get("title") or slice_id),
+        status="active",
+        opened_at=payload["active_slice"]["opened_at"],
+        branch=branch,
+        worktree=str(worktree),
+        plan_dir=str(plan_state["plan_dir"]),
+        plan_status=str(plan_state["plan_status"]),
+        ready_for_execution=bool(plan_state["ready_for_execution"]),
+        blocked_reason=None,
+        blocked_at=None,
+    )
+    payload["phase"] = "implementing"
+    payload["controller_state"] = "opened"
+    payload["heartbeat_at"] = now_utc()
     save_run(run_dir, payload)
     return {
         **payload["active_slice"],
@@ -631,7 +648,39 @@ def record_slice(
 
     if active and active.get("slice_id") == slice_id:
         payload["active_slice"] = None
+    title = None
+    if isinstance(active_slice, dict):
+        title = active_slice.get("title")
+    elif isinstance(existing_entry, dict):
+        title = existing_entry.get("title")
+    queue_status = {
+        "success": "done",
+        "failed": "failed",
+        "skipped": "skipped",
+    }.get(status_name)
+    if queue_status is not None:
+        ordinal_value = 1
+        if isinstance(active_slice, dict) and isinstance(active_slice.get("ordinal"), int):
+            ordinal_value = int(active_slice["ordinal"])
+        elif isinstance(existing_entry, dict) and isinstance(existing_entry.get("ordinal"), int):
+            ordinal_value = int(existing_entry["ordinal"])
+        upsert_candidate_entry(
+            run_dir,
+            slice_id=slice_id,
+            ordinal=ordinal_value,
+            title=str(title or slice_id),
+            status=queue_status,
+            create_missing=True,
+            completed_at=recorded_at,
+            summary=summary,
+            branch=branch,
+            commit=commit,
+            worktree=worktree,
+        )
 
+    payload["phase"] = "planning"
+    payload["controller_state"] = "recorded"
+    payload["heartbeat_at"] = now_utc()
     save_run(run_dir, payload)
     append_terminal_sample(run_dir, payload, entry)
     return entry

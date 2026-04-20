@@ -90,6 +90,7 @@ FALLBACK_ALLOWED_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+VERIFY_COMMAND_TIMEOUT_SECONDS = 1200
 
 
 def verification_artifact_dir(run_dir: Path, slice_id: str) -> Path:
@@ -364,26 +365,44 @@ def verify_slice(
     all_passed = True
     for index, command in enumerate(policy["commands"], start=1):
         started_at = dt.datetime.now(dt.timezone.utc)
-        completed = subprocess.run(
-            ["bash", "-lc", command],
-            cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-        )
+        timed_out = False
+        exit_code: int | None
+        stdout = ""
+        stderr = ""
+        try:
+            completed = subprocess.run(
+                ["bash", "-lc", command],
+                cwd=str(worktree_path),
+                capture_output=True,
+                text=True,
+                timeout=VERIFY_COMMAND_TIMEOUT_SECONDS,
+            )
+            exit_code = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            completed = None
+            timed_out = True
+            exit_code = None
+            stdout = exc.stdout or ""
+            stderr = (exc.stderr or "") + (
+                f"\nTimed out after {VERIFY_COMMAND_TIMEOUT_SECONDS} seconds."
+            )
         ended_at = dt.datetime.now(dt.timezone.utc)
         stdout_path = artifact_dir / f"{index:02d}-stdout.log"
         stderr_path = artifact_dir / f"{index:02d}-stderr.log"
-        write_text_atomic(stdout_path, completed.stdout)
-        write_text_atomic(stderr_path, completed.stderr)
+        write_text_atomic(stdout_path, stdout)
+        write_text_atomic(stderr_path, stderr)
         duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
-        passed = completed.returncode == 0
+        passed = exit_code == 0 and not timed_out
         all_passed = all_passed and passed
         results.append(
             {
                 "ordinal": index,
                 "command": command,
                 "status": "passed" if passed else "failed",
-                "exit_code": completed.returncode,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
                 "duration_seconds": round(duration_seconds, 3),
                 "stdout_log": relative_to(stdout_path, run_dir),
                 "stderr_log": relative_to(stderr_path, run_dir),

@@ -13,6 +13,7 @@ from unittest import mock
 
 import afk_mode
 import afk_mode_runtime
+import afk_mode_runtime.candidate_queue as candidate_queue
 import afk_mode_runtime.hook_config as hook_config
 import afk_mode_runtime.kernel_run as kernel_run
 import yaml
@@ -56,6 +57,18 @@ class AfkModeRuntimeTest(unittest.TestCase):
         env["HOME"] = str(self.root)
         return subprocess.run(
             ["python3", str(Path(__file__).with_name("afk_mode.py")), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+
+    def run_wrapper(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["HOME"] = str(self.root)
+        wrapper = Path(__file__).resolve().parents[1] / "afk-mode"
+        return subprocess.run(
+            [str(wrapper), *args],
             capture_output=True,
             text=True,
             check=True,
@@ -135,21 +148,105 @@ class AfkModeRuntimeTest(unittest.TestCase):
         return profile_path
 
     def rank_candidates(self, run_dir: Path, slice_id: str = "slice-one") -> None:
-        candidates_path = run_dir / "candidates.md"
-        content = candidates_path.read_text(encoding="utf-8")
-        ranked = content.replace(
-            afk_mode.CANDIDATES_PLACEHOLDER,
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": slice_id,
+                "ordinal": 1,
+                "title": slice_id,
+                "plan_status": "frozen",
+                "ready_for_execution": True,
+            },
+        )
+        self.write_plan_artifacts(run_dir, slice_id, include_frozen_plan=True)
+
+    def write_candidate_queue(self, run_dir: Path, *entries: dict[str, object]) -> None:
+        slices = []
+        for index, raw in enumerate(entries, start=1):
+            slice_id = str(raw.get("slice_id") or f"slice-{index}")
+            slices.append(
+                {
+                    "slice_id": slice_id,
+                    "ordinal": int(raw.get("ordinal") or index),
+                    "title": str(raw.get("title") or slice_id),
+                    "source": raw.get("source") or {"kind": "manual_override"},
+                    "estimate": raw.get("estimate")
+                    or {
+                        "size": "medium",
+                        "risk": "medium",
+                        "verify_cost": "medium",
+                    },
+                    "status": str(raw.get("status") or "queued"),
+                    "dependencies": list(raw.get("dependencies") or []),
+                    "requires_workflow_token": bool(raw.get("requires_workflow_token", False)),
+                    "plan_status": str(raw.get("plan_status") or "missing"),
+                    "ready_for_execution": bool(raw.get("ready_for_execution", False)),
+                    "workflow_evidence": raw.get("workflow_evidence") or {},
+                }
+            )
+        (run_dir / afk_mode.CANDIDATES_QUEUE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "generated_at": "2026-04-20T00:00:00+00:00",
+                    "slices": slices,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (run_dir / "candidates.md").write_text(
             "\n".join(
                 [
-                    f"1. `{slice_id}`",
-                    "   - Why it is in scope",
-                    "   - Why it is safe overnight",
-                    "   - Expected verification",
-                    "   - Estimated difficulty",
+                    "# AFK Run Candidates",
+                    "",
+                    "## Candidate Queue",
+                    "",
+                    *[
+                        "\n".join(
+                            [
+                                f"{entry['ordinal']}. `{entry['slice_id']}`",
+                                f"   - Title: {entry['title']}",
+                                f"   - Status: {entry['status']}",
+                            ]
+                        )
+                        for entry in slices
+                    ],
+                    "",
                 ]
             ),
+            encoding="utf-8",
         )
-        candidates_path.write_text(ranked, encoding="utf-8")
+
+    def write_plan_artifacts(
+        self,
+        run_dir: Path,
+        slice_id: str,
+        *,
+        include_plan: bool = True,
+        include_review_summary: bool = True,
+        include_frozen_plan: bool = False,
+    ) -> Path:
+        plan_dir = candidate_queue.plan_dir_for(run_dir, slice_id)
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        if include_plan:
+            (plan_dir / "plan.json").write_text(
+                json.dumps({"slice_id": slice_id, "goal": "Implement candidate"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        if include_review_summary:
+            (plan_dir / "review_summary.json").write_text(
+                json.dumps({"slice_id": slice_id, "decision": "freeze" if include_frozen_plan else "revise"}, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+        if include_frozen_plan:
+            (plan_dir / "frozen_plan.json").write_text(
+                json.dumps({"slice_id": slice_id, "decision": "freeze"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        return plan_dir
 
     def write_candidates_meta(self, run_dir: Path, *entries: dict[str, str]) -> None:
         payload = {"slices": list(entries)}
@@ -250,9 +347,47 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertEqual(payload["verification_source"], "fallback")
         self.assertIn("verify_change.py", payload["verification"]["commands"][0])
 
+    def test_discover_reports_assistive_repo_with_agents_truth_only(self) -> None:
+        repo = self.init_repo("agents-only")
+        (repo / "AGENTS.md").write_text("# Routing\n", encoding="utf-8")
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "verify_change.py").write_text("print('ok')\n", encoding="utf-8")
+        self.commit_paths(repo, "AGENTS.md", "scripts/verify_change.py", message="Add repo truth")
+
+        payload = afk_mode.discover_repo(repo)
+
+        self.assertEqual(payload["design_docs"], [])
+        self.assertIn("AGENTS.md", payload["truth_sources"])
+        self.assertEqual(payload["trust_mode"], afk_mode.TRUST_MODE_ASSISTIVE)
+        self.assertEqual(payload["write_mode"], "none")
+
+        begin_payload = afk_mode.begin_run(repo, "30m", self.run_root)
+        self.assertTrue(begin_payload["blocked"])
+        self.assertEqual(begin_payload["blocker_code"], "profile_required")
+
+    def test_discover_non_repo_lists_agents_only_repo_candidate(self) -> None:
+        base = self.root / "projects"
+        base.mkdir()
+        repo = base / "agents-repo"
+        repo.mkdir()
+        self.git(repo, "init")
+        self.git(repo, "config", "user.name", "AFK Mode Test")
+        self.git(repo, "config", "user.email", "afk-mode@example.com")
+        (repo / "AGENTS.md").write_text("# Routing\n", encoding="utf-8")
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "verify_change.py").write_text("print('ok')\n", encoding="utf-8")
+        self.git(repo, "add", "AGENTS.md", "scripts/verify_change.py")
+        self.git(repo, "commit", "-m", "Add agents-only repo truth")
+
+        payload = afk_mode.discover_repo(base)
+
+        self.assertEqual(payload["repo_candidates"][0]["repo_root"], str(repo))
+        self.assertIn("AGENTS.md", payload["repo_candidates"][0]["truth_sources"])
+
     def test_facade_exports_runtime_surface(self) -> None:
         expected = [
             "AfkModeError",
+            "advance_run",
             "discover_repo",
             "bootstrap_profile",
             "begin_run",
@@ -279,6 +414,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
     def test_runtime_package_exports_exact_surface(self) -> None:
         expected = {
             "CANDIDATES_PLACEHOLDER",
+            "CANDIDATES_QUEUE_FILENAME",
             "CHECKED_IN_PROFILE_RELATIVE_PATHS",
             "DEFAULT_PROFILE_ROOT",
             "DEFAULT_RUN_ROOT",
@@ -288,6 +424,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
             "TRUST_MODE_TRUSTED",
             "TRUST_MODES",
             "AfkModeError",
+            "advance_run",
             "approve_guardrail",
             "begin_run",
             "bootstrap_profile",
@@ -300,6 +437,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
             "load_run",
             "open_slice",
             "pretool_decision",
+            "repair_active_runs",
             "record_slice",
             "relative_to",
             "save_patch",
@@ -318,6 +456,17 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.commit_paths(repo, "SPEC.md", message="Add spec")
 
         result = self.run_cli("discover", "--cwd", str(repo))
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["repo_root"], str(repo))
+        self.assertTrue(payload["git"]["is_repo"])
+
+    def test_wrapper_discover_smoke(self) -> None:
+        repo = self.init_repo()
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.commit_paths(repo, "SPEC.md", message="Add spec")
+
+        result = self.run_wrapper("discover", "--cwd", str(repo))
         payload = json.loads(result.stdout)
 
         self.assertEqual(payload["repo_root"], str(repo))
@@ -466,6 +615,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
                             "verify_cost": "fast",
                             "wall_clock_seconds": 1500,
                             "verification_seconds": 60,
+                            "residual_seconds": 1440,
                             "estimate_point_minutes": 0,
                             "estimate_upper_minutes": 0,
                         },
@@ -480,6 +630,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
                             "verify_cost": "fast",
                             "wall_clock_seconds": 1800,
                             "verification_seconds": 75,
+                            "residual_seconds": 1725,
                             "estimate_point_minutes": 0,
                             "estimate_upper_minutes": 0,
                         },
@@ -494,6 +645,24 @@ class AfkModeRuntimeTest(unittest.TestCase):
         payload = afk_mode.estimate_candidates(run_dir)
         estimate = payload["slices"][0]
 
+        self.assertEqual(
+            set(estimate),
+            {
+                "slice_id",
+                "ordinal",
+                "size",
+                "risk",
+                "verify_cost",
+                "point_minutes",
+                "upper_minutes",
+                "fit_status",
+                "estimation_confidence",
+                "samples_used",
+                "source",
+                "reason",
+                "metadata_defaulted",
+            },
+        )
         self.assertEqual(estimate["source"], "local_exact")
         self.assertEqual(estimate["samples_used"], 5)
         self.assertEqual(estimate["point_minutes"], 20.0)
@@ -502,6 +671,240 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertEqual(estimate["fit_status"], "fit")
         self.assertIn("5 local exact samples", estimate["reason"])
 
+    def test_estimate_candidates_prefers_recent_samples_within_exact_cohort(self) -> None:
+        repo = self.init_repo("estimate-recent")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+
+        self.rank_candidates(run_dir, slice_id="slice-recent")
+        self.write_candidates_meta(
+            run_dir,
+            {
+                "slice_id": "slice-recent",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+            },
+        )
+
+        fingerprint = afk_mode.default_profile_path(repo, self.root / ".codex" / "repo-profiles").stem
+        metrics_path = self.root / ".codex" / "afk-metrics" / f"{fingerprint}.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        samples = []
+        for index in range(25):
+            samples.append(
+                {
+                    "run_id": f"r{index + 1}",
+                    "slice_id": f"s{index + 1}",
+                    "recorded_at": f"2026-04-{index + 1:02d}T00:00:00+00:00",
+                    "status": "success",
+                    "write_mode": "repo_owned",
+                    "size": "small",
+                    "risk": "low",
+                    "verify_cost": "fast",
+                    "wall_clock_seconds": 1800 if index >= 20 else 600,
+                    "verification_seconds": 30,
+                    "estimate_point_minutes": 0,
+                    "estimate_upper_minutes": 0,
+                }
+            )
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "repo_root": str(repo),
+                    "fingerprint": fingerprint,
+                    "samples": samples,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        estimate = afk_mode.estimate_candidates(run_dir)["slices"][0]
+
+        self.assertEqual(estimate["source"], "local_exact")
+        self.assertEqual(estimate["samples_used"], 20)
+        self.assertEqual(estimate["point_minutes"], 10.0)
+        self.assertEqual(estimate["upper_minutes"], 30.0)
+
+    def test_estimate_candidates_uses_file_order_when_recorded_at_is_missing(self) -> None:
+        repo = self.init_repo("estimate-file-order")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+
+        self.rank_candidates(run_dir, slice_id="slice-file-order")
+        self.write_candidates_meta(
+            run_dir,
+            {
+                "slice_id": "slice-file-order",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+            },
+        )
+
+        fingerprint = afk_mode.default_profile_path(repo, self.root / ".codex" / "repo-profiles").stem
+        metrics_path = self.root / ".codex" / "afk-metrics" / f"{fingerprint}.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        samples = []
+        for index in range(25):
+            samples.append(
+                {
+                    "run_id": f"r{index + 1}",
+                    "slice_id": f"s{index + 1}",
+                    "status": "success",
+                    "write_mode": "repo_owned",
+                    "size": "small",
+                    "risk": "low",
+                    "verify_cost": "fast",
+                    "wall_clock_seconds": 1800 if index >= 20 else 600,
+                    "verification_seconds": 30,
+                    "estimate_point_minutes": 0,
+                    "estimate_upper_minutes": 0,
+                }
+            )
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "repo_root": str(repo),
+                    "fingerprint": fingerprint,
+                    "samples": samples,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        estimate = afk_mode.estimate_candidates(run_dir)["slices"][0]
+
+        self.assertEqual(estimate["source"], "local_exact")
+        self.assertEqual(estimate["samples_used"], 20)
+        self.assertEqual(estimate["upper_minutes"], 30.0)
+
+    def test_estimate_candidates_applies_recent_window_after_cohort_selection(self) -> None:
+        repo = self.init_repo("estimate-cohort")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+
+        self.rank_candidates(run_dir, slice_id="slice-cohort")
+        self.write_candidates_meta(
+            run_dir,
+            {
+                "slice_id": "slice-cohort",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+            },
+        )
+
+        fingerprint = afk_mode.default_profile_path(repo, self.root / ".codex" / "repo-profiles").stem
+        metrics_path = self.root / ".codex" / "afk-metrics" / f"{fingerprint}.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        samples = [
+            {
+                "run_id": "exact-1",
+                "slice_id": "exact-1",
+                "recorded_at": "2026-04-01T00:00:00+00:00",
+                "status": "success",
+                "write_mode": "repo_owned",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+                "wall_clock_seconds": 900,
+                "verification_seconds": 30,
+                "estimate_point_minutes": 0,
+                "estimate_upper_minutes": 0,
+            },
+            {
+                "run_id": "exact-2",
+                "slice_id": "exact-2",
+                "recorded_at": "2026-04-02T00:00:00+00:00",
+                "status": "failed",
+                "write_mode": "repo_owned",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+                "wall_clock_seconds": 1200,
+                "verification_seconds": 45,
+                "estimate_point_minutes": 0,
+                "estimate_upper_minutes": 0,
+            },
+            {
+                "run_id": "exact-3",
+                "slice_id": "exact-3",
+                "recorded_at": "2026-04-03T00:00:00+00:00",
+                "status": "success",
+                "write_mode": "repo_owned",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+                "wall_clock_seconds": 1500,
+                "verification_seconds": 60,
+                "estimate_point_minutes": 0,
+                "estimate_upper_minutes": 0,
+            },
+            {
+                "run_id": "exact-4",
+                "slice_id": "exact-4",
+                "recorded_at": "2026-04-04T00:00:00+00:00",
+                "status": "success",
+                "write_mode": "repo_owned",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+                "wall_clock_seconds": 1800,
+                "verification_seconds": 75,
+                "estimate_point_minutes": 0,
+                "estimate_upper_minutes": 0,
+            },
+        ]
+        for index in range(20):
+            samples.append(
+                {
+                    "run_id": f"partial-{index}",
+                    "slice_id": f"partial-{index}",
+                    "recorded_at": f"2026-05-{index + 1:02d}T00:00:00+00:00",
+                    "status": "success",
+                    "write_mode": "repo_owned",
+                    "size": "small",
+                    "risk": "medium",
+                    "verify_cost": "fast",
+                    "wall_clock_seconds": 600,
+                    "verification_seconds": 20,
+                    "estimate_point_minutes": 0,
+                    "estimate_upper_minutes": 0,
+                }
+            )
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "repo_root": str(repo),
+                    "fingerprint": fingerprint,
+                    "samples": samples,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        estimate = afk_mode.estimate_candidates(run_dir)["slices"][0]
+
+        self.assertEqual(estimate["source"], "local_exact")
+        self.assertEqual(estimate["samples_used"], 4)
+        self.assertEqual(estimate["point_minutes"], 22.5)
+
     def test_open_slice_returns_estimate_warning_and_status_surfaces_estimates(self) -> None:
         repo = self.init_repo()
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
@@ -509,21 +912,18 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
         started = afk_mode.start_run(repo, "30m", self.run_root)
         run_dir = Path(started["run_dir"])
-        candidates_path = run_dir / "candidates.md"
-        content = candidates_path.read_text(encoding="utf-8")
-        candidates_path.write_text(
-            content.replace(
-                afk_mode.CANDIDATES_PLACEHOLDER,
-                "\n".join(
-                    [
-                        "1. `slice-over`",
-                        "   - High effort",
-                        "2. `slice-next`",
-                        "   - Lower effort",
-                    ]
-                ),
-            ),
-            encoding="utf-8",
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": "slice-over",
+                "ordinal": 1,
+                "title": "High effort",
+            },
+            {
+                "slice_id": "slice-next",
+                "ordinal": 2,
+                "title": "Lower effort",
+            },
         )
         self.write_candidates_meta(
             run_dir,
@@ -540,6 +940,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 "verify_cost": "fast",
             },
         )
+        self.write_plan_artifacts(run_dir, "slice-over", include_frozen_plan=True)
 
         active = afk_mode.open_slice(run_dir, "slice-over", 1, "over")
 
@@ -623,6 +1024,14 @@ class AfkModeRuntimeTest(unittest.TestCase):
 
         self.assertEqual(statuses, {"success", "failed"})
         self.assertTrue(all(sample["size"] == "small" for sample in payload["samples"]))
+        self.assertTrue(all("residual_seconds" in sample for sample in payload["samples"]))
+        self.assertTrue(
+            all(
+                sample["residual_seconds"] >= 0
+                and sample["residual_seconds"] <= sample["wall_clock_seconds"]
+                for sample in payload["samples"]
+            )
+        )
 
     def test_discover_accepts_root_fallback_checked_in_profile(self) -> None:
         repo = self.init_repo()
@@ -762,6 +1171,29 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertTrue(result["started"])
         self.assertFalse(result["blocked"])
         self.assertEqual(result["run"]["trust_mode"], afk_mode.TRUST_MODE_TRUSTED)
+
+    def test_begin_run_accepts_checked_in_profile_truth_order_without_detected_design_docs(self) -> None:
+        repo = self.init_repo("profile-truth")
+        (repo / "docs").mkdir()
+        (repo / "docs" / "IMPLEMENTATION.md").write_text("# Implementation\n", encoding="utf-8")
+        self.write_profile(repo)
+
+        profile_path = repo / ".codex" / "plugin-profile.yaml"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        profile["truth"]["order"] = ["docs/IMPLEMENTATION.md"]
+        profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+        self.commit_paths(
+            repo,
+            "docs/IMPLEMENTATION.md",
+            ".codex/plugin-profile.yaml",
+            message="Add checked-in profile truth order",
+        )
+
+        result = afk_mode.begin_run(repo, "30m", self.run_root)
+
+        self.assertTrue(result["started"])
+        self.assertFalse(result["blocked"])
+        self.assertIn("docs/IMPLEMENTATION.md", result["discovery"]["truth_sources"])
 
     def test_begin_run_reports_dirty_ack_blocker(self) -> None:
         repo = self.init_repo()
@@ -1172,7 +1604,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.write_profile(repo)
         self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
 
-        started = afk_mode.start_run(repo, "45m", self.run_root)
+        started = afk_mode.start_run(repo, "2h", self.run_root)
         hooks_payload = self.load_hooks()
         self.assertIn("SessionStart", hooks_payload["hooks"])
         self.assertIn("PreToolUse", hooks_payload["hooks"])
@@ -1240,7 +1672,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.write_profile(repo)
         self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
 
-        started = afk_mode.start_run(repo, "45m", self.run_root)
+        started = afk_mode.start_run(repo, "2h", self.run_root)
         hooks_payload = self.load_hooks()
         stop_commands = [
             hook["command"]
@@ -1385,7 +1817,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         started = afk_mode.start_run(repo, "30m", self.run_root)
         run_dir = Path(started["run_dir"])
 
-        with self.assertRaisesRegex(afk_mode.AfkModeError, "Rank slices"):
+        with self.assertRaisesRegex(afk_mode.AfkModeError, "was not found in candidates.json"):
             afk_mode.open_slice(run_dir, "slice-gated", 1, "gated")
 
         self.rank_candidates(run_dir, slice_id="slice-gated")
@@ -1665,7 +2097,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(push_guardrail["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(push_guardrail["hookSpecificOutput"]["guardrail"]["rule_id"], "ask-push")
-        self.assertIn(str(Path(afk_mode.__file__).resolve()), push_guardrail["systemMessage"])
+        self.assertIn(str(Path(__file__).resolve().parents[1] / "afk-mode"), push_guardrail["systemMessage"])
         self.assertIn("--rule-id ask-push", push_guardrail["systemMessage"])
 
         approval = afk_mode.approve_guardrail(
@@ -1696,7 +2128,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(release_guardrail["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(release_guardrail["hookSpecificOutput"]["guardrail"]["rule_id"], "ask-release")
-        self.assertIn(str(Path(afk_mode.__file__).resolve()), release_guardrail["systemMessage"])
+        self.assertIn(str(Path(__file__).resolve().parents[1] / "afk-mode"), release_guardrail["systemMessage"])
         self.assertIn("--approved-command", release_guardrail["systemMessage"])
 
         release_approval = afk_mode.approve_guardrail(
@@ -1770,6 +2202,24 @@ class AfkModeRuntimeTest(unittest.TestCase):
                 run_root=self.run_root,
             )
         )
+
+    def test_cli_repair_registry_resets_corrupt_payload_when_requested(self) -> None:
+        registry_path = self.run_root / "active-runs.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text('{"runs": ', encoding="utf-8")
+
+        result = self.run_cli(
+            "repair-registry",
+            "--run-root",
+            str(self.run_root),
+            "--reset-corrupt",
+        )
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["status"], "reset_corrupt")
+        self.assertTrue(Path(payload["backup"]).exists())
+        repaired = json.loads(registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(repaired["runs"], {})
 
     def test_save_patch_requires_active_slice_worktree_and_run_patch_dir(self) -> None:
         repo = self.init_repo()
@@ -2004,7 +2454,7 @@ class AfkModeRuntimeTest(unittest.TestCase):
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
         self.write_profile(repo)
         self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
-        started = afk_mode.start_run(repo, "45m", self.run_root)
+        started = afk_mode.start_run(repo, "2h", self.run_root)
         run_dir = Path(started["run_dir"])
         self.rank_candidates(run_dir, slice_id="slice-hooks")
         active = afk_mode.open_slice(run_dir, "slice-hooks", 1, "hooks")
@@ -2068,16 +2518,44 @@ class AfkModeRuntimeTest(unittest.TestCase):
         skill_path = Path(__file__).resolve().parents[1] / "skills" / "afk-mode" / "SKILL.md"
         content = skill_path.read_text(encoding="utf-8")
 
-        self.assertIn("/home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py", content)
+        self.assertIn("The public user-facing entrypoint is the skill invocation itself:", content)
+        self.assertIn("`$afk-mode 90m`", content)
+        self.assertIn("Do not ask the user to type `begin-run`, `advance-run`, `open-slice`, or other", content)
+        self.assertIn('AFK_MODE_CMD="${AFK_MODE_CMD:-${AFK_MODE_PLUGIN_DIR:-$HOME/plugins/afk-mode}/afk-mode}"', content)
+        self.assertIn('"${AFK_MODE_CMD}" begin-run --cwd "$PWD" --budget "<duration>"', content)
+        self.assertNotIn("/home/ydhcjswo/plugins/afk-mode", content)
         self.assertNotIn("python3 scripts/afk_mode.py", content)
         self.assertNotIn("python3 ../../scripts/afk_mode.py", content)
+
+    def test_plugin_interface_prompts_use_explicit_afk_mode_entrypoint(self) -> None:
+        plugin_path = Path(__file__).resolve().parents[1] / ".codex-plugin" / "plugin.json"
+        plugin_payload = json.loads(plugin_path.read_text(encoding="utf-8"))
+        default_prompt = " ".join(plugin_payload["interface"]["defaultPrompt"])
+        self.assertIn("$afk-mode <budget>", default_prompt)
+        self.assertIn("only user-facing entrypoint", default_prompt)
+
+        agent_prompt_path = Path(__file__).resolve().parents[1] / "skills" / "afk-mode" / "agents" / "openai.yaml"
+        agent_payload = yaml.safe_load(agent_prompt_path.read_text(encoding="utf-8"))
+        self.assertEqual(agent_payload["policy"]["allow_implicit_invocation"], False)
+        self.assertIn("$afk-mode <budget>", agent_payload["interface"]["default_prompt"])
+        self.assertIn("internal helpers", agent_payload["interface"]["default_prompt"])
+
+    def test_publish_script_uses_portable_plugin_dir(self) -> None:
+        script_path = Path(__file__).resolve().with_name("publish_plugin.sh")
+        content = script_path.read_text(encoding="utf-8")
+
+        self.assertIn('TARGET_DIR="${AFK_MODE_PLUGIN_DIR:-${HOME}/plugins/afk-mode}"', content)
+        self.assertIn("--exclude __pycache__", content)
+        self.assertIn("--exclude '*.pyc'", content)
+        self.assertIn('find "${TARGET_DIR}" -type d -name __pycache__ -prune -exec rm -rf {} +', content)
+        self.assertIn('find "${TARGET_DIR}" -type f -name \'*.pyc\' -delete', content)
 
     def test_hook_script_payload_contracts_are_stable(self) -> None:
         repo = self.init_repo("hook-contracts")
         (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
         self.write_profile(repo)
         self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
-        started = afk_mode.start_run(repo, "45m", self.run_root)
+        started = afk_mode.start_run(repo, "2h", self.run_root)
         run_dir = Path(started["run_dir"])
         self.rank_candidates(run_dir, slice_id="slice-contracts")
         afk_mode.open_slice(run_dir, "slice-contracts", 1, "contracts")
@@ -2116,7 +2594,6 @@ class AfkModeRuntimeTest(unittest.TestCase):
         self.assertIn("decision", stop_payload)
         self.assertIn("reason", stop_payload)
         self.assertEqual(stop_payload["decision"], "block")
-
         reentrant_payload = json.loads(
             self.run_plugin_script(
                 plugin_root / "hooks" / "stop_guard.py",
@@ -2125,6 +2602,244 @@ class AfkModeRuntimeTest(unittest.TestCase):
         )
         self.assertIn("continue", reentrant_payload)
         self.assertTrue(reentrant_payload["continue"])
+
+    def test_start_run_writes_structured_candidate_queue_and_status_fields(self) -> None:
+        repo = self.init_repo("queue-fields")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+        queue_path = run_dir / afk_mode.CANDIDATES_QUEUE_FILENAME
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(queue["slices"])
+        self.assertEqual(queue["slices"][0]["status"], "queued")
+        self.assertEqual(queue["slices"][0]["source"]["kind"], "repo_truth")
+
+        status_payload = afk_mode.status(run_dir)
+        self.assertEqual(status_payload["phase"], "planning")
+        self.assertEqual(status_payload["controller_state"], "queued")
+        self.assertIsNotNone(status_payload["heartbeat_at"])
+        self.assertEqual(status_payload["wake_policy"], "hard_blockers_only")
+        self.assertEqual(status_payload["planning_budget_ratio"], 0.2)
+        self.assertEqual(status_payload["verification_reserve_ratio"], 0.2)
+        self.assertEqual(status_payload["resume_policy"], "fail_stale_active_slice")
+        self.assertEqual(status_payload["consecutive_failures"], 0)
+        self.assertFalse(status_payload["stale"])
+
+    def test_advance_run_selects_repo_workflow_candidate_and_requests_plan_first(self) -> None:
+        repo = self.init_repo("advance-open")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_status(repo, "20260420-queue", phase="worker", summary="Implement queued task")
+        self.write_profile(repo)
+        self.commit_paths(
+            repo,
+            "SPEC.md",
+            ".codex/plugin-profile.yaml",
+            ".codex/work/20260420-queue/STATUS.json",
+            message="Add workflow-backed candidate",
+        )
+
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertEqual(advanced["next_action"], "draft_plan")
+        self.assertEqual(advanced["selected_candidate"]["slice_id"], "20260420-queue")
+        self.assertEqual(advanced["phase"], "planning")
+        self.assertEqual(advanced["controller_state"], "plan_required")
+        self.assertFalse(advanced["wake_operator"])
+        self.assertEqual(advanced["blocker_severity"], "none")
+        self.assertTrue(Path(advanced["plan_dir"]).exists())
+
+    def test_advance_run_opens_frozen_candidate_and_requests_implementation(self) -> None:
+        repo = self.init_repo("advance-frozen")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_status(repo, "20260420-queue", phase="worker", summary="Implement queued task")
+        self.write_profile(repo)
+        self.commit_paths(
+            repo,
+            "SPEC.md",
+            ".codex/plugin-profile.yaml",
+            ".codex/work/20260420-queue/STATUS.json",
+            message="Add workflow-backed candidate",
+        )
+
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.write_plan_artifacts(run_dir, "20260420-queue", include_frozen_plan=True)
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertTrue(advanced["requires_implementation"])
+        self.assertEqual(advanced["next_action"], "requires_implementation")
+        self.assertEqual(advanced["active_slice"]["slice_id"], "20260420-queue")
+        self.assertEqual(advanced["phase"], "implementing")
+        self.assertEqual(advanced["controller_state"], "opened")
+
+    def test_advance_run_blocks_fallback_runs_for_unattended_mode(self) -> None:
+        repo = self.init_repo("advance-fallback")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "verify_change.py").write_text("print('ok')\n", encoding="utf-8")
+        self.commit_paths(repo, "SPEC.md", "scripts/verify_change.py", message="Add fallback signals")
+
+        started = afk_mode.start_run(repo, "30m", self.run_root, allow_fallback_write=True)
+        run_dir = Path(started["run_dir"])
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertTrue(advanced["blocked"])
+        self.assertEqual(advanced["phase"], "blocked")
+        self.assertEqual(advanced["last_blocker"]["code"], "overnight_repo_owned_required")
+        self.assertEqual(advanced["blocker_severity"], "hard")
+        self.assertTrue(advanced["wake_operator"])
+
+    def test_advance_run_blocks_missing_workflow_evidence_as_hard_blocker(self) -> None:
+        repo = self.init_repo("advance-workflow-evidence")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": "slice-needs-workflow",
+                "ordinal": 1,
+                "title": "Needs workflow evidence",
+                "requires_workflow_token": True,
+            },
+        )
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertTrue(advanced["blocked"])
+        self.assertEqual(advanced["blocker_code"], "workflow_evidence_required")
+        self.assertEqual(advanced["blocker_severity"], "hard")
+        self.assertTrue(advanced["wake_operator"])
+
+    def test_advance_run_stops_softly_when_no_candidate_fits_budget(self) -> None:
+        repo = self.init_repo("advance-over-budget")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        started = afk_mode.start_run(repo, "10m", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": "slice-large",
+                "ordinal": 1,
+                "title": "Large slice",
+            },
+        )
+        self.write_candidates_meta(
+            run_dir,
+            {
+                "slice_id": "slice-large",
+                "size": "large",
+                "risk": "high",
+                "verify_cost": "slow",
+            },
+        )
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertTrue(advanced["finished"])
+        self.assertEqual(advanced["status"], "stopped")
+        self.assertEqual(advanced["blocker_code"], "no_candidate_within_budget")
+        self.assertEqual(advanced["blocker_severity"], "soft")
+        self.assertFalse(advanced["wake_operator"])
+
+    def test_advance_run_prefers_smallest_safe_frozen_candidate(self) -> None:
+        repo = self.init_repo("advance-smallest-safe")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        started = afk_mode.start_run(repo, "3h", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": "slice-large",
+                "ordinal": 1,
+                "title": "Large slice",
+                "ready_for_execution": True,
+                "plan_status": "frozen",
+            },
+            {
+                "slice_id": "slice-small",
+                "ordinal": 2,
+                "title": "Small slice",
+                "ready_for_execution": True,
+                "plan_status": "frozen",
+            },
+        )
+        self.write_plan_artifacts(run_dir, "slice-large", include_frozen_plan=True)
+        self.write_plan_artifacts(run_dir, "slice-small", include_frozen_plan=True)
+        self.write_candidates_meta(
+            run_dir,
+            {
+                "slice_id": "slice-large",
+                "size": "large",
+                "risk": "medium",
+                "verify_cost": "medium",
+            },
+            {
+                "slice_id": "slice-small",
+                "size": "small",
+                "risk": "low",
+                "verify_cost": "fast",
+            },
+        )
+
+        advanced = afk_mode.advance_run(run_dir)
+
+        self.assertEqual(advanced["active_slice"]["slice_id"], "slice-small")
+
+    def test_advance_run_records_success_and_finishes_completed_run(self) -> None:
+        repo = self.init_repo("advance-success")
+        (repo / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
+        self.write_profile(repo)
+        self.commit_paths(repo, "SPEC.md", ".codex/plugin-profile.yaml", message="Add spec")
+
+        started = afk_mode.start_run(repo, "2h", self.run_root)
+        run_dir = Path(started["run_dir"])
+        self.write_candidate_queue(
+            run_dir,
+            {
+                "slice_id": "slice-controller",
+                "ordinal": 1,
+                "title": "Controller slice",
+                "ready_for_execution": True,
+                "plan_status": "frozen",
+            },
+        )
+        self.write_plan_artifacts(run_dir, "slice-controller", include_frozen_plan=True)
+
+        opened = afk_mode.advance_run(run_dir)
+        worktree = Path(opened["active_slice"]["worktree"])
+        (worktree / "tracked.txt").write_text("controller\n", encoding="utf-8")
+
+        finished = afk_mode.advance_run(
+            run_dir,
+            implementation_result="done",
+            summary="Controller recorded the slice",
+        )
+
+        self.assertTrue(finished["finished"])
+        self.assertEqual(finished["status"], "completed")
+        payload = afk_mode.load_run(run_dir)
+        self.assertEqual(payload["slices"][0]["status"], "success")
+        queue = json.loads((run_dir / afk_mode.CANDIDATES_QUEUE_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(queue["slices"][0]["status"], "done")
 
 
 if __name__ == "__main__":

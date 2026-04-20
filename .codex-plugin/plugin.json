@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "AFK Mode",
     "shortDescription": "Budgeted repo automation with safety hooks",
-    "longDescription": "Run a bounded overnight coding session for one repository, track the active run, work on isolated slice branches, and guard risky commands with global Codex hooks.",
+    "longDescription": "Publicly invoke AFK Mode through $afk-mode for a bounded single-repo coding run. The skill drives isolated slice branches, run tracking, and guardrails internally.",
     "developerName": "ydhcjswo",
     "category": "Productivity",
     "capabilities": [
@@ -31,7 +31,7 @@
     "privacyPolicyURL": "https://openai.com/policies/privacy-policy/",
     "termsOfServiceURL": "https://openai.com/policies/terms-of-use/",
     "defaultPrompt": [
-      "Use $afk-mode to inspect the current repo, ask for a runtime budget, rank safe slices, and run them on isolated branches."
+      "Use $afk-mode <budget> as the only user-facing entrypoint. The skill should handle begin-run and advance-run internally."
     ],
     "brandColor": "#2E6B5B"
   }

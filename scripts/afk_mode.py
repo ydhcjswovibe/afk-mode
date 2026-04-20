@@ -15,6 +15,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from afk_mode_runtime import (  # noqa: E402
     CANDIDATES_PLACEHOLDER,
+    CANDIDATES_QUEUE_FILENAME,
     CHECKED_IN_PROFILE_RELATIVE_PATHS,
     DEFAULT_PROFILE_ROOT,
     DEFAULT_RUN_ROOT,
@@ -24,6 +25,7 @@ from afk_mode_runtime import (  # noqa: E402
     TRUST_MODE_TRUSTED,
     TRUST_MODES,
     AfkModeError,
+    advance_run,
     approve_guardrail,
     begin_run,
     bootstrap_profile,
@@ -36,6 +38,7 @@ from afk_mode_runtime import (  # noqa: E402
     load_run,
     open_slice,
     pretool_decision,
+    repair_active_runs,
     record_slice,
     relative_to,
     save_patch,
@@ -48,6 +51,7 @@ from afk_mode_runtime import (  # noqa: E402
 
 __all__ = [
     "CANDIDATES_PLACEHOLDER",
+    "CANDIDATES_QUEUE_FILENAME",
     "CHECKED_IN_PROFILE_RELATIVE_PATHS",
     "DEFAULT_PROFILE_ROOT",
     "DEFAULT_RUN_ROOT",
@@ -57,6 +61,7 @@ __all__ = [
     "TRUST_MODE_TRUSTED",
     "TRUST_MODES",
     "AfkModeError",
+    "advance_run",
     "approve_guardrail",
     "begin_run",
     "bootstrap_profile",
@@ -70,6 +75,7 @@ __all__ = [
     "open_slice",
     "parse_args",
     "pretool_decision",
+    "repair_active_runs",
     "record_slice",
     "relative_to",
     "save_patch",
@@ -171,6 +177,17 @@ def parse_args() -> argparse.Namespace:
     status_parser = subparsers.add_parser("status", help="Show run status.")
     status_parser.add_argument("--run-dir", required=True)
 
+    advance_parser = subparsers.add_parser(
+        "advance-run",
+        help="Advance one unattended controller tick for a running AFK run.",
+    )
+    advance_parser.add_argument("--run-dir", required=True)
+    advance_parser.add_argument(
+        "--implementation-result",
+        choices=("done", "failed", "skipped"),
+    )
+    advance_parser.add_argument("--summary")
+
     estimate_parser = subparsers.add_parser(
         "estimate-candidates",
         help="Estimate ranked candidate slices using repo baselines and local telemetry.",
@@ -221,6 +238,21 @@ def parse_args() -> argparse.Namespace:
     cleanup_parser = subparsers.add_parser("cleanup-run", help="Remove closed run worktrees.")
     cleanup_parser.add_argument("--run-dir", required=True)
 
+    repair_parser = subparsers.add_parser(
+        "repair-registry",
+        help="Repair or reset the active afk run registry.",
+    )
+    repair_parser.add_argument(
+        "--run-root",
+        default=str(DEFAULT_RUN_ROOT),
+        help="Root directory for afk run artifacts.",
+    )
+    repair_parser.add_argument(
+        "--reset-corrupt",
+        action="store_true",
+        help="Back up a corrupt registry and replace it with an empty registry.",
+    )
+
     return parser.parse_args()
 
 
@@ -266,6 +298,12 @@ def main() -> int:
             )
         elif args.command == "status":
             payload = status(Path(args.run_dir))
+        elif args.command == "advance-run":
+            payload = advance_run(
+                Path(args.run_dir),
+                implementation_result=args.implementation_result,
+                summary=args.summary,
+            )
         elif args.command == "estimate-candidates":
             payload = estimate_candidates(Path(args.run_dir))
         elif args.command == "open-slice":
@@ -300,6 +338,11 @@ def main() -> int:
             )
         elif args.command == "cleanup-run":
             payload = cleanup_run(Path(args.run_dir))
+        elif args.command == "repair-registry":
+            payload = repair_active_runs(
+                Path(args.run_root),
+                reset_corrupt=args.reset_corrupt,
+            )
         else:
             raise AfkModeError(f"Unsupported command: {args.command}")
     except AfkModeError as exc:

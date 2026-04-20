@@ -20,6 +20,7 @@ from .common import (
     parse_timestamp,
     repo_fingerprint,
 )
+from .candidate_queue import load_candidate_queue, refresh_candidate_queue
 
 
 ESTIMATION_SOURCE_BASELINE = "baseline"
@@ -29,6 +30,7 @@ ESTIMATION_CONFIDENCE_LOW = "low"
 ESTIMATION_CONFIDENCE_MEDIUM = "medium"
 ESTIMATION_CONFIDENCE_HIGH = "high"
 ESTIMATION_TERMINAL_STATUSES = {"success", "failed"}
+RECENT_WINDOW_SAMPLES = 20
 DEFAULT_ESTIMATION_CONFIG = {
     "size_minutes": {
         "small": 20.0,
@@ -220,6 +222,8 @@ def append_terminal_sample(run_dir: Path, run_payload: dict[str, Any], entry: di
     status_name = str(entry.get("status") or "")
     if status_name not in ESTIMATION_TERMINAL_STATUSES:
         return
+    wall_clock_seconds = _sample_seconds(entry.get("wall_clock_seconds"))
+    verification_seconds = _sample_seconds(entry.get("verification_seconds"))
     sample = {
         "run_id": run_payload["run_id"],
         "slice_id": entry.get("slice_id"),
@@ -229,8 +233,9 @@ def append_terminal_sample(run_dir: Path, run_payload: dict[str, Any], entry: di
         "size": entry.get("size", DEFAULT_CANDIDATE_METADATA["size"]),
         "risk": entry.get("risk", DEFAULT_CANDIDATE_METADATA["risk"]),
         "verify_cost": entry.get("verify_cost", DEFAULT_CANDIDATE_METADATA["verify_cost"]),
-        "wall_clock_seconds": float(entry.get("wall_clock_seconds") or 0.0),
-        "verification_seconds": float(entry.get("verification_seconds") or 0.0),
+        "wall_clock_seconds": wall_clock_seconds,
+        "verification_seconds": verification_seconds,
+        "residual_seconds": _residual_seconds(wall_clock_seconds, verification_seconds),
         "estimate_point_minutes": float(entry.get("estimate_point_minutes") or 0.0),
         "estimate_upper_minutes": float(entry.get("estimate_upper_minutes") or 0.0),
     }
@@ -251,6 +256,16 @@ def append_terminal_sample(run_dir: Path, run_payload: dict[str, Any], entry: di
 
 
 def parse_ranked_candidates(run_dir: Path) -> list[dict[str, Any]]:
+    queue = load_candidate_queue(run_dir)
+    if queue.get("slices"):
+        return [
+            {
+                "ordinal": int(entry["ordinal"]),
+                "slice_id": str(entry["slice_id"]),
+                "status": str(entry.get("status") or "queued"),
+            }
+            for entry in queue["slices"]
+        ]
     candidates_path = run_dir / "candidates.md"
     if not candidates_path.exists():
         raise AfkModeError("Run candidates.md is missing.")
@@ -271,6 +286,7 @@ def parse_ranked_candidates(run_dir: Path) -> list[dict[str, Any]]:
             {
                 "ordinal": ordinal,
                 "slice_id": slice_id,
+                "status": "queued",
             }
         )
         seen.add(slice_id)
@@ -331,29 +347,73 @@ def _candidate_metadata(
     return deepcopy(metadata), False
 
 
+def _sample_seconds(value: Any) -> float:
+    try:
+        normalized = float(value or 0.0)
+    except (TypeError, ValueError):
+        normalized = 0.0
+    return max(0.0, normalized)
+
+
+def _residual_seconds(wall_clock_seconds: float, verification_seconds: float) -> float:
+    return round(max(0.0, wall_clock_seconds - verification_seconds), 3)
+
+
+def _normalize_terminal_sample(raw: Any, *, sample_order: int) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    status_name = str(raw.get("status") or "")
+    if status_name not in ESTIMATION_TERMINAL_STATUSES:
+        return None
+    try:
+        wall_clock_seconds = float(raw.get("wall_clock_seconds") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    wall_clock_seconds = max(0.0, wall_clock_seconds)
+    verification_seconds = _sample_seconds(raw.get("verification_seconds"))
+    residual_seconds = (
+        _sample_seconds(raw.get("residual_seconds"))
+        if "residual_seconds" in raw
+        else _residual_seconds(wall_clock_seconds, verification_seconds)
+    )
+    recorded_at = raw.get("recorded_at")
+    recorded_timestamp = parse_timestamp(recorded_at) if isinstance(recorded_at, str) and recorded_at else None
+    return {
+        "status": status_name,
+        "write_mode": str(raw.get("write_mode") or ""),
+        "size": str(raw.get("size") or DEFAULT_CANDIDATE_METADATA["size"]),
+        "risk": str(raw.get("risk") or DEFAULT_CANDIDATE_METADATA["risk"]),
+        "verify_cost": str(raw.get("verify_cost") or DEFAULT_CANDIDATE_METADATA["verify_cost"]),
+        "wall_clock_seconds": wall_clock_seconds,
+        "verification_seconds": verification_seconds,
+        "residual_seconds": residual_seconds,
+        "recorded_at": recorded_at,
+        "recorded_timestamp": recorded_timestamp.timestamp() if recorded_timestamp is not None else None,
+        "sample_order": sample_order,
+    }
+
+
 def _terminal_samples(run_dir: Path, run_payload: dict[str, Any]) -> list[dict[str, Any]]:
     samples = _load_metrics(run_dir, run_payload).get("samples") or []
     normalized: list[dict[str, Any]] = []
-    for sample in samples:
-        if not isinstance(sample, dict):
+    for index, sample in enumerate(samples):
+        entry = _normalize_terminal_sample(sample, sample_order=index)
+        if entry is None:
             continue
-        if sample.get("status") not in ESTIMATION_TERMINAL_STATUSES:
-            continue
-        try:
-            wall_clock_seconds = float(sample.get("wall_clock_seconds") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        normalized.append(
-            {
-                "status": sample.get("status"),
-                "write_mode": str(sample.get("write_mode") or ""),
-                "size": str(sample.get("size") or DEFAULT_CANDIDATE_METADATA["size"]),
-                "risk": str(sample.get("risk") or DEFAULT_CANDIDATE_METADATA["risk"]),
-                "verify_cost": str(sample.get("verify_cost") or DEFAULT_CANDIDATE_METADATA["verify_cost"]),
-                "wall_clock_seconds": max(0.0, wall_clock_seconds),
-            }
-        )
+        normalized.append(entry)
     return normalized
+
+
+def _recent_cohort_window(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(
+        samples,
+        key=lambda sample: (
+            0 if sample.get("recorded_timestamp") is not None else 1,
+            -float(sample.get("recorded_timestamp") or 0.0),
+            -int(sample.get("sample_order") or 0),
+        ),
+    )
+    return ordered[:RECENT_WINDOW_SAMPLES]
 
 
 def _sample_minutes(values_seconds: list[float]) -> list[float]:
@@ -445,33 +505,36 @@ def _select_local_bucket(
     min_local_samples: int,
 ) -> tuple[str, list[float]]:
     exact = [
-        sample["wall_clock_seconds"]
+        sample
         for sample in samples
         if sample["write_mode"] == write_mode
         and sample["size"] == size
         and sample["risk"] == risk
         and sample["verify_cost"] == verify_cost
     ]
-    if len(exact) >= min_local_samples:
-        return ESTIMATION_SOURCE_LOCAL_EXACT, exact
+    exact_window = [sample["wall_clock_seconds"] for sample in _recent_cohort_window(exact)]
+    if len(exact_window) >= min_local_samples:
+        return ESTIMATION_SOURCE_LOCAL_EXACT, exact_window
 
     partial = [
-        sample["wall_clock_seconds"]
+        sample
         for sample in samples
         if sample["write_mode"] == write_mode
         and sample["size"] == size
         and sample["verify_cost"] == verify_cost
     ]
-    if len(partial) >= min_local_samples:
-        return ESTIMATION_SOURCE_LOCAL_PARTIAL, partial
+    partial_window = [sample["wall_clock_seconds"] for sample in _recent_cohort_window(partial)]
+    if len(partial_window) >= min_local_samples:
+        return ESTIMATION_SOURCE_LOCAL_PARTIAL, partial_window
 
     broader = [
-        sample["wall_clock_seconds"]
+        sample
         for sample in samples
         if sample["size"] == size and sample["verify_cost"] == verify_cost
     ]
-    if len(broader) >= min_local_samples:
-        return ESTIMATION_SOURCE_LOCAL_PARTIAL, broader
+    broader_window = [sample["wall_clock_seconds"] for sample in _recent_cohort_window(broader)]
+    if len(broader_window) >= min_local_samples:
+        return ESTIMATION_SOURCE_LOCAL_PARTIAL, broader_window
     return ESTIMATION_SOURCE_BASELINE, []
 
 
@@ -634,27 +697,57 @@ def next_slice_estimate(
 ) -> dict[str, Any] | None:
     if remaining_seconds is None:
         remaining_seconds = _remaining_seconds_from_payload(run_payload)
-    ranked = parse_ranked_candidates(run_dir)
-    completed = {
-        str(entry.get("slice_id"))
-        for entry in run_payload.get("slices") or []
-        if isinstance(entry, dict) and entry.get("slice_id")
-    }
+    queue = refresh_candidate_queue(run_dir)
     active_slice = str((run_payload.get("active_slice") or {}).get("slice_id") or "")
     metadata_lookup = load_candidates_metadata(run_dir)
-    for entry in ranked:
-        slice_id = entry["slice_id"]
-        if slice_id == active_slice or slice_id in completed:
+    terminal = {
+        str(entry.get("slice_id"))
+        for entry in queue.get("slices") or []
+        if str(entry.get("status") or "") in {"done", "failed", "blocked", "skipped"}
+    }
+    candidates: list[tuple[int, int, int, float, int, str, dict[str, Any]]] = []
+    for entry in queue.get("slices") or []:
+        slice_id = str(entry.get("slice_id") or "")
+        queue_status = str(entry.get("status") or "queued")
+        if slice_id == active_slice:
             continue
-        return estimate_one_slice(
+        if queue_status not in {"queued"}:
+            continue
+        workflow_evidence = entry.get("workflow_evidence") or {}
+        if entry.get("requires_workflow_token") and not workflow_evidence.get("validated"):
+            continue
+        dependencies = [dependency for dependency in entry.get("dependencies") or [] if dependency]
+        if any(dependency not in terminal for dependency in dependencies):
+            continue
+        estimate = estimate_one_slice(
             run_dir,
             run_payload,
             slice_id=slice_id,
-            ordinal=entry["ordinal"],
+            ordinal=int(entry["ordinal"]),
             remaining_seconds=remaining_seconds,
             metadata_lookup=metadata_lookup,
         )
-    return None
+        if estimate.get("fit_status") == "over":
+            continue
+        fit_rank = 0 if estimate.get("fit_status") == "fit" else 1
+        source_kind = str((entry.get("source") or {}).get("kind") or "")
+        workflow_rank = 0 if source_kind == "workflow_item" else 1
+        ready_rank = 0 if entry.get("ready_for_execution") else 1
+        candidates.append(
+            (
+                workflow_rank,
+                ready_rank,
+                fit_rank,
+                float(estimate["upper_minutes"]),
+                int(entry["ordinal"]),
+                slice_id,
+                estimate,
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[:6])
+    return candidates[0][6]
 
 
 def estimate_warning_for_slice(estimate: dict[str, Any] | None) -> str | None:

@@ -52,6 +52,7 @@ CHECKED_IN_PROFILE_RELATIVE_PATHS = (
 DURATION_PART_RE = re.compile(r"(?P<value>\d+)(?P<unit>h|m|s)")
 CANDIDATES_PLACEHOLDER = "Fill this section with the ranked shortlist before execution starts."
 CANDIDATES_META_FILENAME = "candidates.meta.json"
+CANDIDATES_QUEUE_FILENAME = "candidates.json"
 DESTRUCTIVE_COMMAND_RE = re.compile(
     r"(^|\s)(rm\s+-rf|git\s+reset\s+--hard|git\s+checkout\s+--|git\s+clean\s+-fdx?|mv\s+.+\s+/dev/null)",
     re.IGNORECASE,
@@ -145,13 +146,20 @@ def run_command(
     *,
     cwd: Path | None = None,
     check: bool = True,
+    timeout_seconds: int = 300,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        command,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AfkModeError(
+            f"{' '.join(command)} timed out after {timeout_seconds} seconds."
+        ) from exc
     if check and result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()

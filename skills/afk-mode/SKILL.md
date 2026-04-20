@@ -1,6 +1,6 @@
 ---
 name: afk-mode
-description: "Use when the user wants a budgeted overnight coding run in the current repository: ask for a runtime budget, inspect the repo's design docs and workflow state, rank safe implementation slices, execute each slice in an isolated temporary branch/worktree, verify successful slices, auto-commit them on slice branches, and archive failed slices as patch artifacts. Do not use for native slash-command development, daemonized background scheduling, or cross-repo planning."
+description: "Use when the user wants a budgeted overnight coding run in the current repository: ask for a runtime budget, inspect the repo's truth sources and workflow state, rank safe implementation slices, execute each slice in an isolated temporary branch/worktree, verify successful slices, auto-commit them on slice branches, and archive failed slices as patch artifacts. Do not use for native slash-command development, daemonized background scheduling, or cross-repo planning."
 ---
 
 # AFK Mode
@@ -8,6 +8,21 @@ description: "Use when the user wants a budgeted overnight coding run in the cur
 Use this skill for explicit overnight or time-boxed autonomous work in the
 current repository. This skill is bundled by a local plugin, but invocation
 remains explicit through `$afk-mode` or selection via `/skills`.
+
+## Public Contract
+
+The public user-facing entrypoint is the skill invocation itself:
+
+- `$afk-mode`
+- `$afk-mode 90m`
+- `$afk-mode 6h`
+
+Treat that as the only required user action for normal use. After invocation,
+the skill should drive the runtime helpers itself.
+
+Do not ask the user to type `begin-run`, `advance-run`, `open-slice`, or other
+runtime subcommands unless the user is explicitly debugging the plugin.
+Those commands are internal implementation details of the skill workflow.
 
 Architectural direction for the plugin lives in
 `references/v2-architecture.md`. Prefer that document when reasoning about
@@ -19,7 +34,7 @@ Use `$afk-mode` when the user wants all of the following:
 
 - current-repo work only
 - a runtime budget decided at the start of the run
-- candidate slices chosen from the repo's actual design truth
+- candidate slices chosen from the repo's actual truth sources
 - isolated execution on temporary branches/worktrees
 - successful slices auto-committed
 - failed slices preserved as patch artifacts, then skipped
@@ -29,7 +44,7 @@ Do not use this skill when:
 - the request is to add a new native Codex slash command
 - the user expects a daemon, unattended scheduler, or OS-level background job
 - the request spans multiple repositories
-- the repo has no credible design docs or no safe verification path
+- the repo has no credible repo truth sources or no safe verification path
 - the repo is still in `observe_only` or `assistive` mode and the user does not
   want to add a repo profile or bootstrap a reviewed local overlay
 
@@ -43,17 +58,24 @@ If the user did not already provide a runtime budget, ask one short question:
 
 Accept simple duration answers such as `90m`, `4h`, or `6h30m`.
 
+If the user invoked the skill as `$afk-mode <duration>`, treat the budget as
+already provided and begin immediately.
+
 Once the budget is known, default to starting the run immediately. Do not stop
 to narrate or wait unless the runtime reports a concrete blocker.
 
 ### 2. Begin The Run Immediately
 
-After you have the budget, call the helper's auto-start entrypoint first:
-Use the deployed AFK Mode plugin helper path, not the current repo's `scripts/`
-directory.
+After you have the budget, call the helper's auto-start entrypoint first.
+Set one reusable command first. It defaults to the deployed wrapper path and
+can be overridden if the wrapper is installed elsewhere.
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
+AFK_MODE_CMD="${AFK_MODE_CMD:-${AFK_MODE_PLUGIN_DIR:-$HOME/plugins/afk-mode}/afk-mode}"
+```
+
+```bash
+"${AFK_MODE_CMD}" begin-run --cwd "$PWD" --budget "<duration>"
 ```
 
 `begin-run` does one of two things:
@@ -69,7 +91,7 @@ If the repo is dirty and the user confirms branching from committed `HEAD`,
 retry with:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run \
+"${AFK_MODE_CMD}" begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --ack-dirty-head-baseline
@@ -79,7 +101,7 @@ If the repo has no checked-in write-capable policy but `begin-run` reports
 `fallback_write_approval_required`, retry with:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run \
+"${AFK_MODE_CMD}" begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --allow-fallback-write
@@ -93,13 +115,14 @@ you need extra context for slice ranking:
 Run the helper script first:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py discover --cwd "$PWD"
+"${AFK_MODE_CMD}" discover --cwd "$PWD"
 ```
 
 This returns JSON with:
 
 - repo root and repo name
 - detected design docs
+- effective repo truth sources, including checked-in profile truth order, `AGENTS.md`, and workflow-state globs when present
 - trust mode and repo-profile sources
 - capability verdicts for discovery, workflow read, verification, and isolated writes
 - git baseline and dirty-state signals
@@ -108,8 +131,8 @@ This returns JSON with:
 - recent completed and open workflow tasks
 - nearby repo candidates if the current directory is not a repo
 
-If no credible design docs are found, stop and say afk mode cannot safely
-derive slices for this repo.
+If no credible repo truth sources are found, stop and say afk mode cannot
+safely derive slices for this repo.
 
 If the current directory is not a repo, show the nearby repo candidates and
 stop. Do not auto-pick one.
@@ -126,14 +149,14 @@ fallback write mode. Prefer checked-in repo policy first by either:
 - bootstrapping a reviewed local overlay:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py bootstrap-profile \
+"${AFK_MODE_CMD}" bootstrap-profile \
   --cwd "$PWD"
 ```
 
 Local overlays now only narrow policy or add stricter guardrails. They do not
 grant write access. If no checked-in write-capable policy exists but the repo
-has credible design docs plus deterministic verification, afk mode can still
-run with `--allow-fallback-write`. In fallback mode, afk mode enforces its own
+has credible repo truth plus deterministic verification, afk mode can still run
+with `--allow-fallback-write`. In fallback mode, afk mode enforces its own
 minimal harness:
 
 - source-and-test changes only
@@ -157,7 +180,7 @@ changes, and ask whether to continue or stop after candidate ranking. If the
 user confirms, pass the explicit acknowledgement flag when starting the run:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run \
+"${AFK_MODE_CMD}" begin-run \
   --cwd "$PWD" \
   --budget "<duration>" \
   --ack-dirty-head-baseline
@@ -168,7 +191,7 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run \
 Create a run directory under `~/.codex/afk-runs/`:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py begin-run --cwd "$PWD" --budget "<duration>"
+"${AFK_MODE_CMD}" begin-run --cwd "$PWD" --budget "<duration>"
 ```
 
 Prefer `begin-run` as the default operator entrypoint. `start-run` still exists
@@ -182,6 +205,8 @@ The run helper can start in two modes:
 
 Fallback write is stricter and is only for source-and-test changes. It does not
 allow structural repo-flow changes.
+Overnight unattended control via `advance-run` is only supported for
+`repo_owned` runs. Treat fallback write as manual/operator mode only.
 
 If a checked-in repo profile already exists but does not allow writes, afk
 mode does not bypass that decision with fallback mode. Fix the checked-in
@@ -192,7 +217,9 @@ This creates:
 - `run.json`
 - `discovery.json`
 - `candidates.md`
+- `candidates.json`
 - `candidates.meta.json`
+- `plans/`
 - `logs/`
 - `patches/`
 - `worktrees/`
@@ -201,12 +228,12 @@ Use the returned `run_dir` for the rest of the run.
 The helper also refuses to start a second active afk run for the same repo
 until the earlier run is finished.
 
-### 5. Read Design Truth And Rank Slices
+### 5. Read Repo Truth And Build The Queue
 
-Read the discovered design docs, repo profile truth order, and any repo-local
-operating docs that can change execution rules.
+Read the discovered design docs, effective repo truth sources, and any
+repo-local operating docs that can change execution rules.
 
-Use the repo's design truth as the primary source of candidate slices.
+Use the repo's truth sources as the primary source of candidate slices.
 For repositories that expose future-gap docs and workflow history, combine:
 
 - present contract docs
@@ -214,7 +241,10 @@ For repositories that expose future-gap docs and workflow history, combine:
 - recent completed work items, to avoid repeating already-closed work
 - open workflow items, to prefer bounded continuation work over invented scope
 
-Write a ranked shortlist into `candidates.md`. Keep it compact:
+Treat `candidates.json` as the runtime truth for queue state. `candidates.md`
+is now a human-readable report only.
+
+Keep the candidate report compact:
 
 - slice id
 - why it is in scope
@@ -223,7 +253,7 @@ Write a ranked shortlist into `candidates.md`. Keep it compact:
 - estimated difficulty
 
 Put machine-readable estimate hints into `candidates.meta.json` next to the
-ranked shortlist:
+queue:
 
 - `size: small|medium|large`
 - `risk: low|medium|high`
@@ -234,23 +264,50 @@ state. If a repo profile points to workflow entrypoints or checked-in work-item
 artifacts for non-trivial writes, follow that repo-local workflow inside each
 chosen slice.
 
-Do not leave `candidates.md` in untouched stub state. The runtime helper now
-refuses to open a slice until the ranked shortlist has been written.
+Do not assume candidate selection alone is enough for overnight execution.
+Chosen candidates now need a frozen plan before implementation can start.
 
 If you want a quick advisory ETA before opening anything:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py estimate-candidates --run-dir "$RUN_DIR"
+"${AFK_MODE_CMD}" estimate-candidates --run-dir "$RUN_DIR"
 ```
 
-### 6. Open A Slice Worktree
+### 6. Freeze A Plan Before Opening A Slice
+
+For unattended runs, the main control loop is now:
+
+```bash
+"${AFK_MODE_CMD}" advance-run --run-dir "$RUN_DIR"
+```
+
+`advance-run` can return:
+
+- `draft_plan`
+- `revise_plan`
+- `requires_implementation`
+- `blocked`
+- `finished`
+
+When it selects a candidate but no frozen plan exists yet, it returns a
+`plan_dir`. Write the planning artifacts there:
+
+- `plan.json`
+- `review_summary.json`
+- `frozen_plan.json`
+
+The runtime only opens a slice after `frozen_plan.json` exists. This keeps the
+planning/review loop inside the orchestrator, while the runtime enforces the
+execution boundary.
+
+### 7. Open A Slice Worktree
 
 Never write directly on the active user branch.
 
 For each chosen slice:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py open-slice \
+"${AFK_MODE_CMD}" open-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --ordinal 1 \
@@ -266,38 +323,41 @@ This creates:
 Perform the implementation only in that worktree.
 
 `open-slice` now returns an advisory estimate and warning when the slice looks
-tight or over-budget. This is guidance only; it does not block admission.
+tight or over-budget. This is guidance only; it does not block admission once a
+frozen plan exists.
 
 The helper refuses to open a new slice when:
 
 - the run budget is already exhausted
-- `candidates.md` is still in untouched stub state
+- the candidate does not have a validated `frozen_plan.json`
+- the candidate requires workflow evidence that has not been validated
 - another slice is already active
 
-### 7. Track Progress
+### 8. Track Progress
 
 Use status whenever you need a concise checkpoint:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py status --run-dir "$RUN_DIR"
+"${AFK_MODE_CMD}" status --run-dir "$RUN_DIR"
 ```
 
 This reports:
 
 - elapsed and remaining budget
+- wake policy and planning reserve settings
 - active slice
 - active slice estimate
-- next ranked slice estimate
+- next queued slice estimate
 - completed count
 - failed count
 - repo baseline
 
-### 8. Record Success
+### 9. Record Success
 
 When a slice passes verification:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py verify-slice \
+"${AFK_MODE_CMD}" verify-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID"
 ```
@@ -305,8 +365,20 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py verify-slice \
 This stores a machine-readable proof artifact under `logs/verification/` for the
 slice. Then record success:
 
+For unattended runs, prefer letting the controller close the slice:
+
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py record-slice \
+"${AFK_MODE_CMD}" advance-run \
+  --run-dir "$RUN_DIR" \
+  --implementation-result done \
+  --summary "Short success summary"
+```
+
+Use the low-level `verify-slice` / `record-slice` path only for manual control
+or recovery.
+
+```bash
+"${AFK_MODE_CMD}" record-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --status success \
@@ -329,15 +401,15 @@ The helper now rejects `--status success` unless it has:
 Then remove closed worktrees owned by the run:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
+"${AFK_MODE_CMD}" cleanup-run --run-dir "$RUN_DIR"
 ```
 
-### 9. Record Failure And Continue
+### 10. Record Failure And Continue
 
 When a slice fails implementation or verification:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py save-patch \
+"${AFK_MODE_CMD}" save-patch \
   --run-dir "$RUN_DIR" \
   --repo-root "$WORKTREE" \
   --output "$RUN_DIR/patches/$SLICE_ID.patch" \
@@ -347,10 +419,19 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py save-patch \
 The helper only allows patch capture from the current active slice worktree and
 only into that run's `patches/` directory.
 
+For unattended runs, prefer the controller path:
+
+```bash
+"${AFK_MODE_CMD}" advance-run \
+  --run-dir "$RUN_DIR" \
+  --implementation-result failed \
+  --summary "Why the slice stopped"
+```
+
 Then:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py record-slice \
+"${AFK_MODE_CMD}" record-slice \
   --run-dir "$RUN_DIR" \
   --slice-id "$SLICE_ID" \
   --status failed \
@@ -363,10 +444,10 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py record-slice \
 Then cleanup:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py cleanup-run --run-dir "$RUN_DIR"
+"${AFK_MODE_CMD}" cleanup-run --run-dir "$RUN_DIR"
 ```
 
-### 10. Finish The Run
+### 11. Finish The Run
 
 Stop when any of the following is true:
 
@@ -378,7 +459,7 @@ Stop when any of the following is true:
 Finish the run with:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py finish-run \
+"${AFK_MODE_CMD}" finish-run \
   --run-dir "$RUN_DIR" \
   --status completed \
   --summary "High-signal summary of completed, failed, and skipped slices"
@@ -386,7 +467,7 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py finish-run \
 
 The final user-facing summary should list:
 
-- trusted design docs
+- trusted repo truth sources
 - ranked slices considered
 - completed slices with branch and commit
 - failed slices with patch paths
@@ -413,7 +494,7 @@ triggered `rule_id` and required approval scope.
 For `rule_for_run` approval:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py approve-guardrail \
+"${AFK_MODE_CMD}" approve-guardrail \
   --run-dir "$RUN_DIR" \
   --rule-id "<rule-id>" \
   --reason "user approved ask-first guardrail"
@@ -422,7 +503,7 @@ python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py approve-guardrail \
 For `exact_command_once` approval:
 
 ```bash
-python3 /home/ydhcjswo/plugins/afk-mode/scripts/afk_mode.py approve-guardrail \
+"${AFK_MODE_CMD}" approve-guardrail \
   --run-dir "$RUN_DIR" \
   --rule-id "<rule-id>" \
   --approved-command "<exact bash command>" \
